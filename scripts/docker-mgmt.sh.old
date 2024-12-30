@@ -1,0 +1,2886 @@
+#!/bin/bash
+#
+# This version includes:
+#   - set -e -u -o pipefail to exit on error (fatal errors stop the script)
+#   - a DEBUG flag and logging function
+#   - checks for gum, jq, and netstat (if used)
+#   - a fatal_error function to handle truly fatal conditions
+#
+
+set -e -u -o pipefail
+
+# Simple debug toggle
+DEBUG=false
+if [ "${1:-}" = "--debug" ]; then
+    DEBUG=true
+fi
+
+# Logging function for debug messages
+log_debug() {
+    if [ "$DEBUG" = true ]; then
+        echo "[DEBUG] $*"
+    fi
+}
+
+# Fatal error helper: prints message and exits the script entirely
+fatal_error() {
+    gum style --foreground 1 "❌ Fatal error: $*"
+    exit 1
+}
+
+# Check if gum is installed
+if ! command -v gum &> /dev/null; then
+    fatal_error "Gum is not installed. Please run ./charmsetup.sh first."
+fi
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    fatal_error "jq is not installed. Please install it (e.g. sudo apt-get install -y jq)."
+fi
+
+# If you rely on netstat later (for checking ports), ensure it's installed:
+if ! command -v netstat &> /dev/null; then
+    log_debug "netstat not found. If 'netstat' usage fails below, install 'net-tools' or similar."
+fi
+
+# Function to save state
+save_docker_change_state() {
+    local STATE_FILE="/tmp/docker_root_change.state"
+    cat > "$STATE_FILE" << EOF
+{
+    "operation": "root_change",
+    "old_path": "$1",
+    "new_path": "$2",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+}
+
+# Function to check state
+check_docker_change_state() {
+    local STATE_FILE="/tmp/docker_root_change.state"
+    if [ -f "$STATE_FILE" ]; then
+        local OLD_PATH
+        local NEW_PATH
+        local TIMESTAMP
+        
+        OLD_PATH=$(jq -r '.old_path' "$STATE_FILE")
+        NEW_PATH=$(jq -r '.new_path' "$STATE_FILE")
+        TIMESTAMP=$(jq -r '.timestamp' "$STATE_FILE")
+        
+        gum style --border normal --border-foreground 212 \
+            "🔍 Found previous Docker root change operation:
+             From: $OLD_PATH
+             To: $NEW_PATH
+             Started: $TIMESTAMP"
+        
+        ACTION=$(gum choose \
+            "Verify the changes (requires logging out/in first)" \
+            "Start over" \
+            "Cancel")
+        
+        case "$ACTION" in
+            "Verify the changes (requires logging out/in first)")
+                # Try to activate docker group first
+                gum style --foreground 4 "🔄 Activating docker group membership..."
+                if ! groups | grep -q docker; then
+                    exec newgrp docker <<EOF
+                    $0
+EOF
+                fi
+                
+                # Now verify the change
+                CURRENT_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+                if [ "$CURRENT_ROOT" = "$NEW_PATH" ]; then
+                    gum style --foreground 2 "✅ Docker root directory change verified successfully!"
+                    gum style --foreground 4 "Current root: $CURRENT_ROOT"
+                    rm -f "$STATE_FILE"
+                    return 0
+                else
+                    gum style --foreground 1 "❌ Verification failed"
+                    gum style --foreground 3 "Expected: $NEW_PATH"
+                    gum style --foreground 3 "Found: $CURRENT_ROOT"
+                    return 1
+                fi
+                ;;
+            "Start over")
+                rm -f "$STATE_FILE"
+                change_docker_root
+                return $?
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+# Main menu function
+show_main_menu() {
+    echo "🐳 Docker Management Tools"
+    
+    CHOICE=$(gum choose \
+        "Container Management" \
+        "Backup & Restore" \
+        "System Management" \
+        "Exit")
+
+    case "$CHOICE" in
+        "Container Management")
+            container_management
+            ;;
+        "Backup & Restore")
+            docker_backup_restore
+            ;;
+        "System Management")
+            system_management
+            ;;
+        "Exit")
+            echo "👋 Goodbye!"
+            exit 0
+            ;;
+    esac
+}
+
+# Container Management submenu
+container_management() {
+    CHOICE=$(gum choose \
+        "List Containers" \
+        "Start Container" \
+        "Stop Container" \
+        "Restart Container" \
+        "Delete Container" \
+        "Container Health" \
+        "Docker Setup" \
+        "Back to Main Menu")
+
+    case "$CHOICE" in
+        "List Containers")
+            if ! docker ps -a &>/dev/null; then
+                gum style --foreground 1 "❌ Cannot connect to Docker daemon"
+                gum style --foreground 3 "Please make sure Docker is running"
+                gum confirm "Return to Container Management?" && container_management || exit 0
+                return
+            fi
+            
+            # Check if there are any containers
+            if [ -z "$(docker ps -a -q)" ]; then
+                gum style --foreground 3 "📦 No containers found"
+            else
+                # Format header and container list separately
+                (
+                    # Print header
+                    printf "%-20s %-20s %-30s %-20s %-20s\n" "CONTAINER ID" "NAME" "IMAGE" "STATUS" "PORTS"
+                    
+                    # Print containers
+                    docker ps -a --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | \
+                        while IFS=$'\t' read -r id name image status ports; do
+                            printf "%-20s %-20s %-30s %-20s %-20s\n" "$id" "$name" "$image" "$status" "$ports"
+                        done
+                ) | gum style --foreground 4
+            fi
+            
+            gum confirm "Return to Container Management?" && container_management || exit 0
+            ;;
+        "Start Container")
+            CONTAINER=$(docker ps -a --format "{{.Names}}" | gum filter --placeholder "Choose container to start...")
+            if [ ! -z "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Starting container $CONTAINER..." -- docker start "$CONTAINER"
+                gum confirm "Container started. Return to Container Management?" && container_management || exit 0
+            fi
+            ;;
+        "Stop Container")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to stop...")
+            if [ ! -z "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Stopping container $CONTAINER..." -- docker stop "$CONTAINER"
+                gum confirm "Container stopped. Return to Container Management?" && container_management || exit 0
+            fi
+            ;;
+        "Restart Container")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to restart...")
+            if [ ! -z "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Restarting container $CONTAINER..." -- docker restart "$CONTAINER"
+                gum confirm "Container restarted. Return to Container Management?" && container_management || exit 0
+            fi
+            ;;
+        "Delete Container")
+            # Show both running and stopped containers
+            CONTAINER=$(docker ps -a --format "{{.Names}}\t{{.Status}}\t{{.Image}}" | \
+                column -t | \
+                gum filter --placeholder "Choose container to delete...")
+            
+            if [ ! -z "$CONTAINER" ]; then
+                # Extract container name from the selection
+                CONTAINER_NAME=$(echo "$CONTAINER" | awk '{print $1}')
+                
+                # Show container details before deletion
+                gum style --foreground 3 "Container details:"
+                docker inspect --format '
+🔹 Name: {{.Name}}
+🔹 Image: {{.Config.Image}}
+🔹 Created: {{.Created}}
+🔹 Status: {{.State.Status}}
+🔹 Networks: {{range $net, $conf := .NetworkSettings.Networks}}
+   - {{$net}} ({{$conf.NetworkID}}){{end}}
+🔹 Volumes: {{range .Mounts}}
+   - {{.Source}} -> {{.Destination}}{{end}}
+' "$CONTAINER_NAME" | gum style --foreground 4
+                
+                # Get networks used by this container
+                NETWORKS=$(docker inspect --format='{{range $net, $conf := .NetworkSettings.Networks}}{{$net}}{{"\n"}}{{end}}' "$CONTAINER_NAME")
+                
+                # Confirm deletion with warning about volumes and networks
+                if gum confirm --negative "⚠️  Delete container '$CONTAINER_NAME'? This cannot be undone!"; then
+                    # Ask about volume deletion
+                    VOLUMES=$(docker inspect --format='{{range .Mounts}}{{.Name}}{{end}}' "$CONTAINER_NAME")
+                    if [ ! -z "$VOLUMES" ] && gum confirm "Delete associated volumes?"; then
+                        VOLUME_FLAG="-v"
+                    else
+                        VOLUME_FLAG=""
+                    fi
+                    
+                    # Remove container
+                    gum spin --spinner dot --title "Removing container..." -- \
+                        docker rm -f $VOLUME_FLAG "$CONTAINER_NAME"
+                    
+                    # Check each network
+                    echo "$NETWORKS" | while read -r network; do
+                        # Skip default networks
+                        if [[ "$network" =~ ^(bridge|host|none)$ ]]; then
+                            continue
+                        fi
+                        
+                        # Check if network is still in use
+                        if [ -z "$(docker network inspect "$network" --format='{{range .Containers}}{{.Name}}{{end}}')" ]; then
+                            gum style --foreground 3 "Network '$network' is no longer in use"
+                            if gum confirm "Delete network '$network'?"; then
+                                gum spin --spinner dot --title "Removing network..." -- \
+                                    docker network rm "$network"
+                            fi
+                        fi
+                    done
+                    
+                    gum style --foreground 2 "✅ Container deleted successfully"
+                fi
+                gum confirm "Return to Container Management?" && container_management || exit 0
+            fi
+            ;;
+        "Container Health")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to check...")
+            if [ ! -z "$CONTAINER" ]; then
+                echo "Health status for $CONTAINER:"
+                docker inspect --format "{{.State.Health.Status}}" "$CONTAINER" 2>/dev/null || echo "No health check configured"
+                docker stats --no-stream "$CONTAINER" | gum table
+                gum confirm "Return to Container Management?" && container_management || exit 0
+            fi
+            ;;
+        "Docker Setup")
+            docker_setup
+            ;;
+        "Back to Main Menu")
+            show_main_menu
+            ;;
+    esac
+}
+
+# Backup & Restore submenu (placeholder)
+backup_restore() {
+    gum style \
+        --foreground 212 \
+        --border-foreground 212 \
+        --border double \
+        --align center \
+        --width 50 \
+        "Backup & Restore - Coming Soon"
+    sleep 2
+    show_main_menu
+}
+
+# System Management submenu (placeholder)
+system_management() {
+    gum style \
+        --foreground 212 \
+        --border-foreground 212 \
+        --border double \
+        --align center \
+        --width 50 \
+        "System Management - Coming Soon"
+    sleep 2
+    show_main_menu
+}
+
+# Docker Setup function
+docker_setup() {
+    CHOICE=$(gum choose \
+        "Check Docker Status" \
+        "Install Docker" \
+        "Reinstall Docker" \
+        "Install Docker Compose" \
+        "Configure Docker" \
+        "Setup Docker Networks" \
+        "Setup Docker Volumes" \
+        "Show Docker Paths" \
+        "Change Docker Root Directory" \
+        "Backup/Restore Docker" \
+        "Install Yacht" \
+        "Back to Container Management")
+
+    case "$CHOICE" in
+        "Check Docker Status")
+            check_docker_status
+            ;;
+        "Install Docker")
+            install_docker
+            ;;
+        "Reinstall Docker")
+            reinstall_docker
+            ;;
+        "Install Docker Compose")
+            install_docker_compose
+            ;;
+        "Configure Docker")
+            configure_docker
+            ;;
+        "Setup Docker Networks")
+            setup_docker_networks
+            ;;
+        "Setup Docker Volumes")
+            setup_docker_volumes
+            ;;
+        "Show Docker Paths")
+            show_docker_paths
+            ;;
+        "Change Docker Root Directory")
+            change_docker_root
+            ;;
+        "Backup/Restore Docker")
+            docker_backup_restore
+            ;;
+        "Install Yacht")
+            install_yacht
+            ;;
+        "Back to Container Management")
+            container_management
+            ;;
+    esac
+}
+
+# Check Docker Status
+check_docker_status() {
+    echo "🔍 Checking Docker installation..."
+    
+    # Check Docker
+    if command -v docker &> /dev/null; then
+        gum style --foreground 2 "✅ Docker is installed"
+        docker --version | gum style --foreground 4
+        
+        # Check Docker service
+        if systemctl is-active --quiet docker; then
+            gum style --foreground 2 "✅ Docker service is running"
+        else
+            gum style --foreground 1 "❌ Docker service is not running"
+            if gum confirm "Would you like to start Docker service?"; then
+                gum spin --spinner dot --title "Starting Docker service..." -- sudo systemctl start docker
+                gum style --foreground 2 "✅ Docker service started"
+            fi
+        fi
+    else
+        gum style --foreground 1 "❌ Docker is not installed"
+        if gum confirm "Would you like to install Docker?"; then
+            install_docker
+        fi
+    fi
+
+    # Check Docker Compose
+    if command -v docker-compose &> /dev/null; then
+        gum style --foreground 2 "✅ Docker Compose is installed"
+        docker-compose --version | gum style --foreground 4
+    else
+        gum style --foreground 1 "❌ Docker Compose is not installed"
+        if gum confirm "Would you like to install Docker Compose?"; then
+            install_docker_compose
+        fi
+    fi
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Function to install Docker and related tools
+install_docker() {
+    gum style --border normal --border-foreground 212 "Installing Docker and Related Tools"
+    
+    # Check if Docker is already installed
+    if command -v docker &> /dev/null; then
+        gum style --foreground 3 "Docker is already installed"
+        docker --version | gum style --foreground 4
+        if ! gum confirm "Would you like to reinstall Docker?"; then
+            return 0
+        fi
+    fi
+    
+    # Update package list
+    gum style --foreground 4 "📦 Updating package list..."
+    if ! sudo apt-get update; then
+        fatal_error "Failed to update package list"
+    fi
+    
+    # Install prerequisites
+    gum style --foreground 4 "📦 Installing prerequisites..."
+    if ! sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+        jq; then
+        fatal_error "Failed to install prerequisites"
+    fi
+    
+    # Add Docker's official GPG key
+    gum style --foreground 4 "🔑 Adding Docker's GPG key..."
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    
+    # Set up Docker repository
+    gum style --foreground 4 "📦 Setting up Docker repository..."
+    echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+    
+    # Update package list again
+    sudo apt-get update
+    
+    # Install Docker
+    gum style --foreground 4 "🐳 Installing Docker..."
+    if ! sudo apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin; then
+        fatal_error "Failed to install Docker"
+    fi
+    
+    # Add current user to docker group
+    gum style --foreground 4 "👤 Adding user to docker group..."
+    if ! sudo usermod -aG docker "$USER"; then
+        fatal_error "Failed to add user to docker group"
+    fi
+    
+    # Create directories for docker-volume-backup
+    gum style --foreground 4 "📁 Setting up backup directories..."
+    sudo mkdir -p /opt/docker/backups
+    sudo chown -R "$USER:$USER" /opt/docker/backups
+    
+    # Create docker-compose.yml and .env files
+    gum style --foreground 4 "📝 Creating backup configuration files..."
+    
+    # Create docker-compose.yml
+    cat > docker-compose.yml << 'EOF'
+version: '3.7'
+
+services:
+  backup:
+    image: offen/docker-volume-backup:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Mount target volumes read-only
+      - yacht:/backup/yacht:ro
+      # Mount docker socket to access container metadata
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Mount backup location
+      - /opt/docker/backups:/archive
+    environment:
+      - BACKUP_CRON_EXPRESSION=0 * * * * # Hourly backups
+      - BACKUP_FILENAME=backup-%Y-%m-%d_%H-%M-%S.tar.gz
+      - BACKUP_RETENTION_DAYS=7
+      - BACKUP_COMPRESSION=gzip
+
+volumes:
+  yacht:
+    external: true
+EOF
+    
+    # Create .env file
+    cat > .env << 'EOF'
+# Backup settings
+BACKUP_SOURCES=/backup
+BACKUP_STOP_CONTAINERS=false
+BACKUP_EXCLUDE_NAMES=
+BACKUP_EXCLUDE_PATHS=
+EOF
+    
+    # Pull the backup image
+    gum style --foreground 4 "📥 Pulling backup service image..."
+    if ! docker pull offen/docker-volume-backup:latest; then
+        fatal_error "Failed to pull backup image"
+    fi
+    
+    # Start the backup service
+    gum style --foreground 4 "🚀 Starting backup service..."
+    if ! docker compose up -d backup; then
+        fatal_error "Failed to start backup service"
+    fi
+    
+    gum style --foreground 2 "✅ Docker and related tools installed successfully"
+    gum style --foreground 3 "⚠️  Please log out and back in for group changes to take effect"
+    
+    return 0
+}
+
+# Install Docker on Debian/Ubuntu
+install_docker_debian() {
+    # Ask for sudo password upfront with clear prompt
+    gum style --foreground 3 "🔐 Sudo access is required for installation"
+    sudo -v
+
+    # Keep sudo alive
+    while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
+    # Complete cleanup of Docker
+    gum style --foreground 4 "🧹 Performing complete Docker cleanup..."
+    
+    # Stop all Docker services
+    sudo systemctl stop docker.socket docker.service containerd 2>/dev/null
+    
+    # Remove all Docker packages
+    sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras
+    sudo apt-get autoremove -y
+    
+    # Remove all Docker files and directories
+    sudo rm -rf /var/lib/docker
+    sudo rm -rf /var/lib/containerd
+    sudo rm -rf /etc/docker
+    sudo rm -rf /var/run/docker.sock
+    sudo rm -rf /etc/systemd/system/docker.service.d
+    sudo rm -rf /etc/systemd/system/containerd.service.d
+    sudo rm -f /etc/apt/sources.list.d/docker.list
+    sudo rm -f /etc/apt/keyrings/docker.gpg
+    
+    # Reset systemd
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+
+    # Clean apt cache
+    sudo apt-get clean
+    sudo apt-get update
+
+    gum style --foreground 4 "📦 Installing prerequisites..."
+    if ! sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+        apt-transport-https \
+        software-properties-common; then
+        fatal_error "Failed to install prerequisites"
+    fi
+
+    # Add Docker's official GPG key
+    gum style --foreground 4 "🔑 Adding Docker's GPG key..."
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    # Set up repository
+    gum style --foreground 4 "📝 Setting up Docker repository..."
+    echo \
+        "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Update apt and install Docker
+    gum style --foreground 4 "🐳 Installing Docker Engine..."
+    if ! sudo apt-get update; then
+        fatal_error "Failed to update package list"
+    fi
+
+    if ! sudo apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin; then
+        fatal_error "Failed to install Docker"
+    fi
+
+    # Configure containerd
+    gum style --foreground 4 "⚙️  Configuring containerd..."
+    sudo mkdir -p /etc/containerd
+    containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+    sudo systemctl restart containerd
+
+    # Start and enable services
+    gum style --foreground 4 "🔄 Starting Docker services..."
+    sudo systemctl enable containerd
+    sudo systemctl enable docker
+    sudo systemctl start containerd
+    sudo systemctl start docker
+
+    # Verify installation
+    if ! docker --version; then
+        fatal_error "Docker installation verification failed"
+    fi
+
+    # Add current user to docker group
+    if gum confirm "Add current user to docker group? (recommended)"; then
+        if ! sudo usermod -aG docker "$USER"; then
+            fatal_error "Failed to add user to docker group"
+        fi
+        gum style --foreground 2 "✅ User added to docker group"
+        gum style --foreground 3 "⚠️  Please log out and back in for group changes to take effect"
+    fi
+
+    gum style --foreground 2 "✅ Docker installation completed successfully"
+    docker --version | gum style --foreground 4
+}
+
+# Install Docker on RHEL/CentOS
+install_docker_rhel() {
+    # Ask for sudo password upfront with clear prompt
+    gum style --foreground 3 "🔐 Sudo access is required for installation"
+    sudo -v
+
+    # Keep sudo alive
+    while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
+    # Install prerequisites
+    gum style --foreground 4 "📦 Installing prerequisites..."
+    if ! sudo yum install -y yum-utils; then
+        fatal_error "Failed to install prerequisites"
+    fi
+
+    # Add Docker repository
+    gum style --foreground 4 "📝 Setting up Docker repository..."
+    if ! sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo; then
+        fatal_error "Failed to add Docker repository"
+    fi
+
+    # Install Docker Engine
+    gum style --foreground 4 "🐳 Installing Docker Engine..."
+    if ! sudo yum install -y docker-ce docker-ce-cli containerd.io; then
+        fatal_error "Failed to install Docker"
+    fi
+
+    # Start and enable Docker service
+    gum style --foreground 4 "🔄 Starting Docker service..."
+    if ! sudo systemctl start docker; then
+        fatal_error "Failed to start Docker service"
+    fi
+
+    if ! sudo systemctl enable docker; then
+        fatal_error "Failed to enable Docker service"
+    fi
+
+    # Add current user to docker group
+    if gum confirm "Add current user to docker group? (recommended)"; then
+        if ! sudo usermod -aG docker "$USER"; then
+            fatal_error "Failed to add user to docker group"
+        fi
+        gum style --foreground 3 "⚠️  Please log out and back in for group changes to take effect"
+    fi
+
+    gum style --foreground 2 "✅ Docker installation completed successfully"
+}
+
+# Install Docker Compose
+install_docker_compose() {
+    if command -v docker-compose &> /dev/null; then
+        gum style --foreground 3 "Docker Compose is already installed"
+        return
+    fi
+
+    # Ask for sudo password upfront with clear prompt
+    gum style --foreground 3 "🔐 Sudo access is required for installation"
+    sudo -v
+
+    # Keep sudo alive
+    while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
+    gum style --foreground 4 "🔍 Checking latest Docker Compose version..."
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep "tag_name" | cut -d '"' -f 4)
+    if [ -z "$COMPOSE_VERSION" ]; then
+        fatal_error "Failed to get latest Docker Compose version"
+    fi
+    
+    gum style --foreground 4 "📥 Downloading Docker Compose ${COMPOSE_VERSION}..."
+    if ! sudo curl -L "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose; then
+        fatal_error "Failed to download Docker Compose"
+    fi
+
+    gum style --foreground 4 "📝 Setting permissions..."
+    if ! sudo chmod +x /usr/local/bin/docker-compose; then
+        fatal_error "Failed to set executable permissions"
+    fi
+
+    if command -v docker-compose &> /dev/null; then
+        gum style --foreground 2 "✅ Docker Compose installed successfully"
+        docker-compose --version | gum style --foreground 4
+    else
+        fatal_error "Docker Compose installation failed"
+    fi
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Configure Docker
+configure_docker() {
+    DAEMON_CONFIG="/etc/docker/daemon.json"
+    
+    # Create config if it doesn't exist
+    if [ ! -f "$DAEMON_CONFIG" ]; then
+        sudo mkdir -p /etc/docker
+        echo "{}" | sudo tee "$DAEMON_CONFIG" > /dev/null
+    fi
+
+    # Show current configuration
+    echo "Current Docker configuration:"
+    sudo cat "$DAEMON_CONFIG" | gum format
+
+    # Configuration options
+    CHOICE=$(gum choose \
+        "Set Log Driver" \
+        "Set Storage Driver" \
+        "Configure Resource Limits" \
+        "Configure Registry Mirrors" \
+        "Back to Docker Setup")
+
+    case "$CHOICE" in
+        "Set Log Driver")
+            # TODO: Implement log driver configuration
+            gum style --foreground 3 "Coming soon..."
+            ;;
+        "Set Storage Driver")
+            # TODO: Implement storage driver configuration
+            gum style --foreground 3 "Coming soon..."
+            ;;
+        "Configure Resource Limits")
+            # TODO: Implement resource limits configuration
+            gum style --foreground 3 "Coming soon..."
+            ;;
+        "Configure Registry Mirrors")
+            # TODO: Implement registry mirrors configuration
+            gum style --foreground 3 "Coming soon..."
+            ;;
+        "Back to Docker Setup")
+            docker_setup
+            ;;
+    esac
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Setup Docker Networks
+setup_docker_networks() {
+    # TODO: Implement network setup
+    gum style --foreground 3 "Coming soon..."
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Setup Docker Volumes
+setup_docker_volumes() {
+    # TODO: Implement volume setup
+    gum style --foreground 3 "Coming soon..."
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Show Docker Paths
+show_docker_paths() {
+    gum style --border normal --border-foreground 212 "Docker Data Locations"
+    
+    # Check if paths exist and show their sizes
+    PATHS=(
+        "/var/lib/docker:Main Docker root directory"
+        "/var/lib/docker/containers:Container data"
+        "/var/lib/docker/volumes:Named volumes"
+        "/var/lib/docker/overlay2:Layer storage"
+        "/var/lib/docker/image:Images"
+        "/var/lib/docker/network:Network configurations"
+        "/var/lib/docker/buildkit:BuildKit state"
+        "/etc/docker:Docker configuration"
+    )
+
+    printf "%-40s %-15s %s\n" "LOCATION" "SIZE" "DESCRIPTION" | gum style --foreground 4
+    echo "--------------------------------------------------------------------------------"
+
+    for PATH_INFO in "${PATHS[@]}"; do
+        PATH_LOC="${PATH_INFO%%:*}"
+        DESC="${PATH_INFO#*:}"
+        
+        if [ -d "$PATH_LOC" ] || [ -f "$PATH_LOC" ]; then
+            SIZE=$(du -sh "$PATH_LOC" 2>/dev/null | cut -f1)
+            printf "%-40s %-15s %s\n" "$PATH_LOC" "$SIZE" "$DESC" | gum style --foreground 2
+        else
+            printf "%-40s %-15s %s\n" "$PATH_LOC" "not found" "$DESC" | gum style --foreground 1
+        fi
+    done
+
+    echo
+    gum style --foreground 3 "Note: You might need sudo rights to view some directories"
+    
+    if gum confirm "Would you like to see detailed disk usage?"; then
+        echo
+        gum style --foreground 4 "Detailed disk usage (this might take a moment)..."
+        sudo du -h --max-depth=1 /var/lib/docker/ 2>/dev/null | sort -hr | gum table
+    fi
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# Function to detect filesystem type and create snapshot
+create_docker_snapshot() {
+    local MOUNT_POINT="$1"
+    local SNAPSHOT_PATH="$2"
+    
+    # Detect filesystem type
+    local FS_TYPE
+    FS_TYPE=$(df -T "$MOUNT_POINT" | tail -n 1 | awk '{print $2}')
+    
+    case "$FS_TYPE" in
+        "btrfs")
+            gum style --foreground 4 "📸 Creating Btrfs snapshot..."
+            sudo btrfs subvolume snapshot -r "$MOUNT_POINT" "$SNAPSHOT_PATH"
+            echo "btrfs"
+            ;;
+        "zfs")
+            gum style --foreground 4 "📸 Creating ZFS snapshot..."
+            local DATASET
+            DATASET=$(zfs list -H -o name "$MOUNT_POINT")
+            sudo zfs snapshot "${DATASET}@backup_$(date +%Y%m%d_%H%M%S)"
+            echo "zfs"
+            ;;
+        "lvm")
+            gum style --foreground 4 "📸 Creating LVM snapshot..."
+            local VG_LV
+            VG_LV=$(lvdisplay | grep "LV Path" | grep docker | awk '{print $3}')
+            sudo lvcreate -L10G -s -n docker_snapshot "$VG_LV"
+            echo "lvm"
+            ;;
+        *)
+            # If no snapshot support, just return empty
+            echo ""
+            ;;
+    esac
+}
+
+# Function to remove snapshot
+remove_docker_snapshot() {
+    local SNAPSHOT_PATH="$1"
+    local FS_TYPE="$2"
+    
+    case "$FS_TYPE" in
+        "btrfs")
+            sudo btrfs subvolume delete "$SNAPSHOT_PATH"
+            ;;
+        "zfs")
+            sudo zfs destroy "${DATASET}@backup_$(date +%Y%m%d_%H%M%S)"
+            ;;
+        "lvm")
+            sudo lvremove -f /dev/docker_vg/docker_snapshot
+            ;;
+    esac
+}
+
+# Update backup function to use snapshots
+backup_docker_config() {
+    local BACKUP_DIR="/tmp/docker_backup_$(date +%Y%m%d_%H%M%S)"
+    local DOCKER_ROOT
+    DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+    local SNAPSHOT_PATH="${DOCKER_ROOT}_snapshot"
+    
+    gum style --foreground 4 "📦 Creating Docker configuration backup..."
+    
+    # Stop Docker services for consistent backup
+    gum style --foreground 4 "🛑 Stopping Docker services..."
+    sudo systemctl stop docker.socket docker.service
+    
+    # Create snapshot if possible
+    local FS_TYPE
+    FS_TYPE=$(create_docker_snapshot "$DOCKER_ROOT" "$SNAPSHOT_PATH")
+    
+    # Create backup directory
+    sudo mkdir -p "$BACKUP_DIR"
+    
+    # Backup from snapshot if available, otherwise from source
+    local BACKUP_SOURCE
+    BACKUP_SOURCE=${FS_TYPE:+$SNAPSHOT_PATH}
+    BACKUP_SOURCE=${BACKUP_SOURCE:-$DOCKER_ROOT}
+    
+    # Create the backup
+    sudo tar czf "$BACKUP_DIR/docker_data.tar.gz" -C "$BACKUP_SOURCE" .
+    
+    # Backup configuration files
+    if [ -f "/etc/docker/daemon.json" ]; then
+        sudo cp -a "/etc/docker/daemon.json" "$BACKUP_DIR/"
+    fi
+    sudo cp -a "/etc/systemd/system/docker.service.d" "$BACKUP_DIR/" 2>/dev/null || true
+    sudo cp -a "/usr/lib/systemd/system/docker.service" "$BACKUP_DIR/" 2>/dev/null || true
+    
+    # Remove snapshot if we created one
+    [ -n "$FS_TYPE" ] && remove_docker_snapshot "$SNAPSHOT_PATH" "$FS_TYPE"
+    
+    # Restart Docker services
+    gum style --foreground 4 "🔄 Restarting Docker services..."
+    sudo systemctl start docker
+    
+    echo "$BACKUP_DIR"
+}
+
+# Update restore_docker_config function to handle snapshots
+restore_docker_config() {
+    local BACKUP_DIR="$1"
+    local DOCKER_ROOT
+    DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+    
+    gum style --foreground 4 "🔄 Restoring Docker configuration..."
+    
+    # Stop Docker services
+    gum style --foreground 4 "🛑 Stopping Docker services..."
+    sudo systemctl stop docker.socket docker.service
+    
+    # Restore configuration files first
+    if [ -f "$BACKUP_DIR/daemon.json" ]; then
+        sudo cp -a "$BACKUP_DIR/daemon.json" "/etc/docker/"
+    fi
+    sudo cp -a "$BACKUP_DIR/docker.service.d" "/etc/systemd/system/" 2>/dev/null || true
+    sudo cp -a "$BACKUP_DIR/docker.service" "/usr/lib/systemd/system/" 2>/dev/null || true
+    
+    # Create a backup of current data before restore
+    local CURRENT_BACKUP="${DOCKER_ROOT}_prerestore_$(date +%Y%m%d_%H%M%S)"
+    if [ -d "$DOCKER_ROOT" ]; then
+        gum style --foreground 4 "📦 Creating backup of current data..."
+        sudo mv "$DOCKER_ROOT" "$CURRENT_BACKUP"
+    fi
+    
+    # Create fresh Docker root
+    sudo mkdir -p "$DOCKER_ROOT"
+    sudo chown root:root "$DOCKER_ROOT"
+    sudo chmod 710 "$DOCKER_ROOT"
+    
+    # Restore data
+    if [ -f "$BACKUP_DIR/docker_data.tar.gz" ]; then
+        gum style --foreground 4 "📦 Restoring Docker data..."
+        sudo tar xzf "$BACKUP_DIR/docker_data.tar.gz" -C "$DOCKER_ROOT"
+    fi
+    
+    # Reload systemd and restart Docker
+    gum style --foreground 4 "🔄 Restarting Docker services..."
+    sudo systemctl daemon-reload
+    sudo systemctl start docker
+    
+    # Verify restore
+    if sudo docker info &>/dev/null; then
+        gum style --foreground 2 "✅ Docker restore completed successfully"
+        # Clean up pre-restore backup after successful restore
+        if gum confirm "Remove pre-restore backup at $CURRENT_BACKUP?"; then
+            sudo rm -rf "$CURRENT_BACKUP"
+        fi
+        return 0
+    else
+        gum style --foreground 1 "❌ Docker failed to start after restore"
+        gum style --foreground 3 "📑 Docker daemon logs:"
+        sudo journalctl -u docker.service -n 50 --no-pager | gum format
+        
+        # Offer to rollback
+        if gum confirm "Would you like to rollback to previous state?"; then
+            sudo rm -rf "$DOCKER_ROOT"
+            sudo mv "$CURRENT_BACKUP" "$DOCKER_ROOT"
+            sudo systemctl restart docker
+        fi
+        return 1
+    fi
+}
+
+# Modify the change_docker_root function to use state management
+change_docker_root() {
+    # First check for existing state
+    if ! check_docker_change_state; then
+        return 1
+    fi
+
+    gum style --border normal --border-foreground 212 "Change Docker Root Directory"
+    
+    # Check Docker permissions first
+    if ! sudo docker info &>/dev/null; then
+        gum style --foreground 1 "❌ Docker is not working properly"
+        if gum confirm "Would you like to try reinstalling Docker?"; then
+            if reinstall_docker; then
+                gum style --foreground 4 "🔄 Retrying Docker root directory change..."
+                sleep 2
+                change_docker_root
+            fi
+            return
+        fi
+        return 1
+    fi
+
+    # Get current Docker root directory using sudo
+    CURRENT_ROOT=$(sudo docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$CURRENT_ROOT" ]; then
+        gum style --foreground 1 "❌ Failed to get Docker root directory"
+        if gum confirm "Would you like to try reinstalling Docker?"; then
+            install_docker
+            # After reinstall, restart this function
+            if [ $? -eq 0 ]; then
+                change_docker_root
+            fi
+            return
+        fi
+        return 1
+    fi
+    gum style "Current Docker root directory: $CURRENT_ROOT"
+    
+    # Common locations for Docker root
+    LOCATION_CHOICE=$(gum choose \
+        "Choose from common locations" \
+        "Enter custom location" \
+        "Cancel")
+
+    case "$LOCATION_CHOICE" in
+        "Choose from common locations")
+            # List of common locations with descriptions
+            NEW_ROOT=$(gum choose \
+                "/var/lib/docker     (Default location)" \
+                "/data/docker        (Separate data partition)" \
+                "/home/docker        (Home directory)" \
+                "/opt/docker         (Optional software)" \
+                "/mnt/docker         (Mounted volume)" \
+                | cut -d' ' -f1)  # Extract just the path
+            ;;
+        "Enter custom location")
+            NEW_ROOT=$(gum input --placeholder "/path/to/new/docker/root")
+            ;;
+        "Cancel")
+            return
+            ;;
+    esac
+    
+    if [ -z "$NEW_ROOT" ]; then
+        gum style --foreground 1 "❌ No directory specified"
+        return 1
+    fi
+
+    # Check if new location has enough space
+    AVAILABLE_SPACE=$(sudo df -h "$NEW_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+    CURRENT_USAGE=$(sudo du -sh "$CURRENT_ROOT" 2>/dev/null | cut -f1)
+    
+    gum style --foreground 3 "📊 Space Analysis:"
+    echo "Current Docker data size: $CURRENT_USAGE"
+    echo "Available space at new location: $AVAILABLE_SPACE"
+
+    # Confirm change
+    gum confirm "Are you sure you want to move Docker root to $NEW_ROOT?" || return
+
+    # Add these checks before moving data
+    gum style --foreground 4 "🔍 Verifying directories..."
+    echo "Current root exists: $(if [ -d "$CURRENT_ROOT" ]; then echo "yes"; else echo "no"; fi)"
+    echo "New root exists: $(if [ -d "$NEW_ROOT" ]; then echo "yes"; else echo "no"; fi)"
+    
+    gum style --foreground 4 "📂 Directory contents:"
+    echo "Current root ($CURRENT_ROOT):"
+    sudo ls -la "$CURRENT_ROOT" 2>&1
+    echo "New root ($NEW_ROOT):"
+    sudo ls -la "$NEW_ROOT" 2>&1
+    
+    # Add a pause to inspect
+    if ! gum confirm "Continue with directory change?"; then
+        return 1
+    fi
+
+    # Rest of the function using sudo for all docker and filesystem operations...
+    gum style --foreground 3 "🛑 Stopping Docker service..."
+    if ! sudo systemctl stop docker.socket docker.service; then
+        gum style --foreground 1 "❌ Failed to stop Docker services"
+        return 1
+    fi
+
+    # Create new directory if it doesn't exist
+    if ! sudo mkdir -p "$NEW_ROOT"; then
+        gum style --foreground 1 "❌ Failed to create new directory"
+        return 1
+    fi
+
+    # Set proper permissions
+    sudo chown root:root "$NEW_ROOT"
+    sudo chmod 710 "$NEW_ROOT"
+
+    # Move existing data if any
+    if [ -d "$CURRENT_ROOT" ] && [ "$(sudo ls -A "$CURRENT_ROOT" 2>/dev/null)" ]; then
+        gum style --foreground 4 "📦 Moving existing Docker data..."
+        if ! sudo rsync -aP "$CURRENT_ROOT/" "$NEW_ROOT/"; then
+            gum style --foreground 1 "❌ Failed to move Docker data"
+            return 1
+        fi
+        
+        # Verify data was moved successfully
+        if [ ! -d "$NEW_ROOT" ] || [ -z "$(sudo ls -A "$NEW_ROOT" 2>/dev/null)" ]; then
+            gum style --foreground 1 "❌ Data move verification failed"
+            return 1
+        fi
+
+        # Create backup of old directory
+        BACKUP_NAME="${CURRENT_ROOT}_backup_$(date +%Y%m%d_%H%M%S)"
+        gum style --foreground 4 "📁 Creating backup of old directory as $BACKUP_NAME..."
+        if ! sudo mv "$CURRENT_ROOT" "$BACKUP_NAME"; then
+            gum style --foreground 1 "❌ Failed to backup old directory"
+            return 1
+        fi
+    fi
+
+    # Update daemon.json
+    gum style --foreground 4 "📝 Updating Docker configuration..."
+    DAEMON_CONFIG="/etc/docker/daemon.json"
+    
+    # Create fresh daemon.json with proper JSON format
+    echo '{
+  "data-root": "'"$NEW_ROOT"'"
+}' | sudo tee "$DAEMON_CONFIG" > /dev/null
+
+    # Ensure proper permissions
+    sudo chown root:root "$DAEMON_CONFIG"
+    sudo chmod 644 "$DAEMON_CONFIG"
+
+    # Verify JSON syntax
+    if ! jq empty "$DAEMON_CONFIG" 2>/dev/null; then
+        gum style --foreground 1 "❌ Invalid JSON syntax in daemon.json"
+        gum style --foreground 3 "Current content:"
+        sudo cat "$DAEMON_CONFIG" | gum format
+        return 1
+    fi
+
+    # After successful move and before restart
+    save_docker_change_state "$CURRENT_ROOT" "$NEW_ROOT"
+
+    # Start Docker service
+    gum style --foreground 4 "🔄 Starting Docker service..."
+    
+    # Get detailed logs before starting
+    gum style --foreground 4 "📋 Current Docker configuration:"
+    sudo cat /etc/docker/daemon.json | gum format
+    
+    # Check directory permissions
+    gum style --foreground 4 "📂 Checking directory permissions..."
+    sudo ls -la "$NEW_ROOT"
+    
+    # Check containerd status
+    gum style --foreground 4 "🔍 Checking containerd status..."
+    sudo systemctl status containerd --no-pager || true
+    
+    # Try to start containerd first
+    sudo systemctl restart containerd
+    sleep 2
+    
+    # Start Docker
+    if ! sudo systemctl start docker; then
+        gum style --foreground 1 "❌ Failed to start Docker service"
+        
+        # Check if it's just a permission issue
+        if sudo docker info &>/dev/null; then
+            gum style --foreground 2 "✅ Docker root directory change appears successful!"
+            gum style --foreground 3 "⚠️  New permissions need to be activated"
+            
+            # Save state for verification
+            save_docker_change_state "$CURRENT_ROOT" "$NEW_ROOT"
+            
+            if gum confirm "Would you like to activate new permissions now?"; then
+                gum style --foreground 4 "🔄 Activating docker group membership..."
+                exec newgrp docker <<EOF
+                $0
+EOF
+            else
+                gum style --foreground 3 "You can either:"
+                gum style --foreground 3 "1. Log out and log back in"
+                gum style --foreground 3 "2. Run 'newgrp docker' in your terminal"
+                gum style --foreground 3 "Then run this script again to verify the changes"
+            fi
+            return 0
+        else
+            # If sudo docker info also fails, then there's a real problem
+            gum style --foreground 3 "📑 Docker daemon logs:"
+            sudo journalctl -u docker.service -n 50 --no-pager | gum format
+            
+            # Ask user what to do
+            ACTION=$(gum choose \
+                "Show full Docker logs" \
+                "Try with SELinux disabled" \
+                "Restore previous configuration" \
+                "Reinstall Docker" \
+                "Cancel")
+            
+            case "$ACTION" in
+                "Show full Docker logs")
+                    sudo journalctl -u docker.service --no-pager | gum pager
+                    ;;
+                "Try with SELinux disabled")
+                    gum style --foreground 4 "🔧 Attempting to start Docker with SELinux disabled..."
+                    if [ -f "/etc/docker/daemon.json" ]; then
+                        sudo sed -i 's/}/,\n  "selinux-enabled": false\n}/' /etc/docker/daemon.json
+                    else
+                        echo '{"selinux-enabled": false}' | sudo tee /etc/docker/daemon.json
+                    fi
+                    sudo systemctl restart docker
+                    ;;
+                "Restore previous configuration")
+                    gum style --foreground 4 "🔄 Restoring previous configuration..."
+                    sudo mv "$BACKUP_NAME" "$CURRENT_ROOT"
+                    sudo sed -i "s|\"data-root\": \".*\"|\"data-root\": \"$CURRENT_ROOT\"|" "$DAEMON_CONFIG"
+                    sudo systemctl restart containerd
+                    sleep 2
+                    sudo systemctl restart docker
+                    ;;
+                "Reinstall Docker")
+                    reinstall_docker
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        fi
+    fi
+
+    # Verify change
+    NEW_LOCATION=$(docker info --format '{{.DockerRootDir}}')#!/bin/bash
+#
+# This version consolidates Docker Compose installation into the main Docker installation flow,
+# reorganizes the menus for a cleaner flow, and ensures we check/install prerequisites before installing Docker.
+#
+# It assumes you are on a Debian/Ubuntu-based system for the Docker install steps.
+# If you need RHEL/CentOS-specific logic, you can adapt the install_docker_rhel function similarly.
+
+set -e -u -o pipefail
+
+# Simple debug toggle
+DEBUG=false
+if [ "${1:-}" = "--debug" ]; then
+    DEBUG=true
+fi
+
+# Logging function for debug messages
+log_debug() {
+    if [ "$DEBUG" = true ]; then
+        echo "[DEBUG] $*"
+    fi
+}
+
+# Fatal error helper: prints message and exits the script entirely
+fatal_error() {
+    gum style --foreground 1 "❌ Fatal error: $*"
+    exit 1
+}
+
+# Check if gum is installed
+if ! command -v gum &> /dev/null; then
+    fatal_error "Gum is not installed. Please run ./charmsetup.sh or install gum first."
+fi
+
+# Check if jq is installed
+if ! command -v jq &> /dev/null; then
+    fatal_error "jq is not installed. Please install it (e.g. sudo apt-get install -y jq)."
+fi
+
+# If you rely on netstat for checking ports, ensure it's installed:
+if ! command -v netstat &> /dev/null; then
+    log_debug "netstat not found. If netstat usage fails below, install the 'net-tools' package."
+fi
+
+###############################################################################
+# State Management for Docker Root Changes
+###############################################################################
+save_docker_change_state() {
+    local STATE_FILE="/tmp/docker_root_change.state"
+    cat > "$STATE_FILE" << EOF
+{
+    "operation": "root_change",
+    "old_path": "$1",
+    "new_path": "$2",
+    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+}
+
+check_docker_change_state() {
+    local STATE_FILE="/tmp/docker_root_change.state"
+    if [ -f "$STATE_FILE" ]; then
+        local OLD_PATH
+        local NEW_PATH
+        local TIMESTAMP
+        
+        OLD_PATH=$(jq -r '.old_path' "$STATE_FILE")
+        NEW_PATH=$(jq -r '.new_path' "$STATE_FILE")
+        TIMESTAMP=$(jq -r '.timestamp' "$STATE_FILE")
+        
+        gum style --border normal --border-foreground 212 \
+            "🔍 Found previous Docker root change operation:
+             From: $OLD_PATH
+             To: $NEW_PATH
+             Started: $TIMESTAMP"
+        
+        ACTION=$(gum choose \
+            "Verify the changes (requires logging out/in first)" \
+            "Start over" \
+            "Cancel")
+        
+        case "$ACTION" in
+            "Verify the changes (requires logging out/in first)")
+                # Try to activate docker group first
+                gum style --foreground 4 "🔄 Activating docker group membership..."
+                if ! groups | grep -q docker; then
+                    exec newgrp docker <<EOF
+                    $0
+EOF
+                fi
+                
+                # Now verify the change
+                CURRENT_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+                if [ "$CURRENT_ROOT" = "$NEW_PATH" ]; then
+                    gum style --foreground 2 "✅ Docker root directory change verified successfully!"
+                    gum style --foreground 4 "Current root: $CURRENT_ROOT"
+                    rm -f "$STATE_FILE"
+                    return 0
+                else
+                    gum style --foreground 1 "❌ Verification failed"
+                    gum style --foreground 3 "Expected: $NEW_PATH"
+                    gum style --foreground 3 "Found: $CURRENT_ROOT"
+                    return 1
+                fi
+                ;;
+            "Start over")
+                rm -f "$STATE_FILE"
+                change_docker_root
+                return $?
+                ;;
+            "Cancel")
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+###############################################################################
+# Main Menu
+###############################################################################
+show_main_menu() {
+    gum style --bold "🐳 Docker Management Tools"
+
+    CHOICE=$(gum choose \
+        "1) Container Operations" \
+        "2) Backup & Restore" \
+        "3) Docker Installation & Configuration" \
+        "4) Advanced / System Tools" \
+        "5) Exit")
+
+    case "$CHOICE" in
+        "1) Container Operations")
+            container_operations
+            ;;
+        "2) Backup & Restore")
+            docker_backup_restore
+            ;;
+        "3) Docker Installation & Configuration")
+            docker_install_config_menu
+            ;;
+        "4) Advanced / System Tools")
+            advanced_system_tools_menu
+            ;;
+        "5) Exit")
+            echo "👋 Goodbye!"
+            exit 0
+            ;;
+    esac
+}
+
+###############################################################################
+# Container Operations Menu
+###############################################################################
+container_operations() {
+    CHOICE=$(gum choose \
+        "List Containers" \
+        "Start Container" \
+        "Stop Container" \
+        "Restart Container" \
+        "Delete Container" \
+        "Container Health" \
+        "Back to Main Menu")
+
+    case "$CHOICE" in
+        "List Containers")
+            if ! docker version &>/dev/null; then
+                gum style --foreground 1 "❌ Docker is not available or not running"
+                if gum confirm "Return to Container Operations Menu?"; then
+                    container_operations
+                else
+                    show_main_menu
+                fi
+                return
+            fi
+
+            if [ -z "$(docker ps -a -q)" ]; then
+                gum style --foreground 3 "📦 No containers found"
+            else
+                (
+                    # Print header
+                    printf "%-20s %-20s %-30s %-20s %-20s\n" "CONTAINER ID" "NAME" "IMAGE" "STATUS" "PORTS"
+                    
+                    # Print containers
+                    docker ps -a --format "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" | \
+                        while IFS=$'\t' read -r id name image status ports; do
+                            printf "%-20s %-20s %-30s %-20s %-20s\n" "$id" "$name" "$image" "$status" "$ports"
+                        done
+                ) | gum style --foreground 4
+            fi
+            
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Start Container")
+            CONTAINER=$(docker ps -a --format "{{.Names}}" | gum filter --placeholder "Choose container to start...")
+            if [ -n "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Starting container $CONTAINER..." -- docker start "$CONTAINER"
+            fi
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Stop Container")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to stop...")
+            if [ -n "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Stopping container $CONTAINER..." -- docker stop "$CONTAINER"
+            fi
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Restart Container")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to restart...")
+            if [ -n "$CONTAINER" ]; then
+                gum spin --spinner dot --title "Restarting container $CONTAINER..." -- docker restart "$CONTAINER"
+            fi
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Delete Container")
+            SELECTED=$(docker ps -a --format "{{.Names}}\t{{.Status}}\t{{.Image}}" | \
+                column -t | \
+                gum filter --placeholder "Choose container to delete...")
+            if [ -n "$SELECTED" ]; then
+                CONTAINER_NAME=$(echo "$SELECTED" | awk '{print $1}')
+                gum style --foreground 3 "Container details:"
+                docker inspect --format '
+🔹 Name: {{.Name}}
+🔹 Image: {{.Config.Image}}
+🔹 Created: {{.Created}}
+🔹 Status: {{.State.Status}}
+🔹 Networks: {{range $net, $conf := .NetworkSettings.Networks}}
+   - {{$net}} ({{$conf.NetworkID}}){{end}}
+🔹 Volumes: {{range .Mounts}}
+   - {{.Source}} -> {{.Destination}}{{end}}
+' "$CONTAINER_NAME" | gum style --foreground 4
+
+                NETWORKS=$(docker inspect --format='{{range $net, $conf := .NetworkSettings.Networks}}{{$net}}{{"\n"}}{{end}}' "$CONTAINER_NAME")
+
+                if gum confirm --negative "⚠️  Delete container '$CONTAINER_NAME'? This cannot be undone!"; then
+                    VOLUMES=$(docker inspect --format='{{range .Mounts}}{{.Name}}{{end}}' "$CONTAINER_NAME")
+                    if [ -n "$VOLUMES" ] && gum confirm "Delete associated volumes?"; then
+                        VOLUME_FLAG="-v"
+                    else
+                        VOLUME_FLAG=""
+                    fi
+                    
+                    gum spin --spinner dot --title "Removing container..." -- \
+                        docker rm -f $VOLUME_FLAG "$CONTAINER_NAME"
+
+                    # Check and remove unused networks
+                    echo "$NETWORKS" | while read -r network; do
+                        if [[ "$network" =~ ^(bridge|host|none)$ ]]; then
+                            continue
+                        fi
+                        if [ -z "$(docker network inspect "$network" --format='{{range .Containers}}{{.Name}}{{end}}')" ]; then
+                            gum style --foreground 3 "Network '$network' is no longer in use"
+                            if gum confirm "Delete network '$network'?"; then
+                                gum spin --spinner dot --title "Removing network..." -- \
+                                    docker network rm "$network"
+                            fi
+                        fi
+                    done
+                    gum style --foreground 2 "✅ Container deleted successfully"
+                fi
+            fi
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Container Health")
+            CONTAINER=$(docker ps --format "{{.Names}}" | gum filter --placeholder "Choose container to check...")
+            if [ -n "$CONTAINER" ]; then
+                gum style --foreground 3 "Health status for $CONTAINER:"
+                docker inspect --format "{{.State.Health.Status}}" "$CONTAINER" 2>/dev/null || echo "No health check configured"
+                docker stats --no-stream "$CONTAINER" | gum table
+            fi
+            gum confirm "Return to Container Operations?" && container_operations || show_main_menu
+            ;;
+        "Back to Main Menu")
+            show_main_menu
+            ;;
+    esac
+}
+
+###############################################################################
+# Backup & Restore Menu
+###############################################################################
+docker_backup_restore() {
+    gum style --border normal --border-foreground 212 "Docker Backup & Restore"
+    
+    ACTION=$(gum choose \
+        "Backup Container" \
+        "Restore Container" \
+        "Backup All Containers" \
+        "System Backup" \
+        "System Restore" \
+        "List Backups" \
+        "Delete Backup" \
+        "Back to Main Menu")
+
+    case "$ACTION" in
+        "Backup Container")
+            CONTAINER=$(docker ps -a --format "{{.Names}}" | gum filter --placeholder "Choose container to backup...")
+            if [ -n "$CONTAINER" ]; then
+                backup_single_container "$CONTAINER"
+            fi
+            ;;
+        "Restore Container")
+            if [ ! -d "/tmp/docker_backups" ]; then
+                gum style --foreground 1 "❌ No backup directory found"
+                return
+            fi
+            BACKUPS=()
+            while IFS= read -r -d '' dir; do
+                CONTAINER_NAME=$(basename "$(dirname "$dir")")
+                TIMESTAMP=$(basename "$dir")
+                BACKUPS+=("$CONTAINER_NAME - $TIMESTAMP")
+            done < <(find /tmp/docker_backups -mindepth 2 -maxdepth 2 -type d -print0)
+            
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No container backups found"
+                return
+            fi
+            
+            SELECTED=$(printf "%s\n" "${BACKUPS[@]}" | gum filter --placeholder "Select backup to restore...")
+            if [ -n "$SELECTED" ]; then
+                CONTAINER_NAME=$(echo "$SELECTED" | cut -d' ' -f1)
+                TIMESTAMP=$(echo "$SELECTED" | cut -d' ' -f3)
+                BACKUP_PATH="/tmp/docker_backups/$CONTAINER_NAME/$TIMESTAMP"
+                
+                if [ -d "$BACKUP_PATH" ]; then
+                    restore_container_backup "$BACKUP_PATH/container.tar"
+                else
+                    gum style --foreground 1 "❌ Backup not found: $BACKUP_PATH"
+                fi
+            fi
+            ;;
+        "Backup All Containers")
+            backup_all_containers
+            ;;
+        "System Backup")
+            backup_docker_config
+            ;;
+        "System Restore")
+            restore_docker_config
+            ;;
+        "List Backups")
+            BACKUPS=( $(ls -d /tmp/docker_backup_* 2>/dev/null || true) )
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No backups found"
+            else
+                gum style --foreground 4 "📂 Available backups:"
+                for backup in "${BACKUPS[@]}"; do
+                    echo "Created: $(date -r "$backup" "+%Y-%m-%d %H:%M:%S") - $backup"
+                done | gum table
+            fi
+            ;;
+        "Delete Backup")
+            BACKUPS=( $(ls -d /tmp/docker_backup_* 2>/dev/null || true) )
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No backups found"
+                return
+            fi
+            SELECTED_BACKUP=$(printf "%s\n" "${BACKUPS[@]}" | gum choose --header "Select backup to delete:")
+            if [ -n "$SELECTED_BACKUP" ]; then
+                if gum confirm "Are you sure you want to delete this backup?"; then
+                    if sudo rm -rf "$SELECTED_BACKUP"; then
+                        gum style --foreground 2 "✅ Backup deleted successfully"
+                    else
+                        gum style --foreground 1 "❌ Failed to delete backup"
+                    fi
+                fi
+            fi
+            ;;
+        "Back to Main Menu")
+            show_main_menu
+            return
+            ;;
+    esac
+
+    gum confirm "Return to Backup & Restore menu?" && docker_backup_restore || show_main_menu
+}
+
+backup_single_container() {
+    local CONTAINER="$1"
+    local BACKUP_DIR="/tmp/docker_backups/$CONTAINER/$(date +%Y%m%d_%H%M%S)"
+    
+    gum style --foreground 4 "📦 Backing up container: $CONTAINER"
+    sudo mkdir -p "$BACKUP_DIR"
+    sudo chown $USER:$USER "$BACKUP_DIR"
+    
+    docker inspect "$CONTAINER" | sudo tee "$BACKUP_DIR/container_info.json" > /dev/null
+    docker inspect --format='{{.Config.Image}}' "$CONTAINER" | sudo tee "$BACKUP_DIR/image_name" > /dev/null
+    
+    docker inspect --format='{{range .Mounts}}{{if ne .Source "/var/run/docker.sock"}}{{.Source}}:{{.Destination}};{{end}}{{end}}' "$CONTAINER" | \
+        sudo tee "$BACKUP_DIR/volumes.txt" > /dev/null
+    
+    while IFS=':' read -r source dest; do
+        if [ -n "$source" ] && [ -n "$dest" ]; then
+            VOLUME_NAME=$(basename "$source")
+            # Skip system volumes
+            if [[ "$source" == "/var/run/docker.sock" ]] || [[ "$source" == "/var/run/"* ]]; then
+                gum style --foreground 3 "⚠️  Skipping system volume: $source"
+                continue
+            fi
+            gum style --foreground 4 "📁 Backing up volume: $VOLUME_NAME"
+            sudo tar czf "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" -C "$source" .
+        fi
+    done < <(sudo cat "$BACKUP_DIR/volumes.txt" | tr ';' '\n')
+    
+    gum style --foreground 4 "💾 Creating container backup..."
+    docker export "$CONTAINER" | sudo tee "$BACKUP_DIR/container.tar" > /dev/null
+    sudo chown -R $USER:$USER "$BACKUP_DIR"
+    gum style --foreground 2 "✅ Backup completed: $BACKUP_DIR"
+}
+
+restore_container_backup() {
+    local BACKUP_PATH="$1"
+    local BACKUP_DIR
+    BACKUP_DIR=$(dirname "$BACKUP_PATH")
+    local CONTAINER_NAME
+    CONTAINER_NAME=$(basename "$(dirname "$BACKUP_DIR")")
+    
+    gum style --foreground 4 "🔄 Restoring container: $CONTAINER_NAME"
+    
+    local CONTAINER_CONFIG
+    CONTAINER_CONFIG=$(sudo cat "$BACKUP_DIR/container_info.json")
+    local IMAGE
+    IMAGE=$(echo "$CONTAINER_CONFIG" | jq -r '.[0].Config.Image')
+    
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        if gum confirm "Container '$CONTAINER_NAME' exists. Remove it?"; then
+            sudo docker rm -f "$CONTAINER_NAME"
+        else
+            return 1
+        fi
+    fi
+    
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        gum style --foreground 4 "📥 Pulling image: $IMAGE"
+        sudo docker pull "$IMAGE"
+    fi
+    
+    if [[ "$IMAGE" == "selfhostedpro/yacht" ]]; then
+        gum style --foreground 4 "📦 Restoring Yacht container..."
+        if ! sudo docker run -d \
+            -p 8000:8000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v yacht:/config \
+            --name yacht \
+            --restart unless-stopped \
+            selfhostedpro/yacht; then
+            gum style --foreground 1 "❌ Failed to restore Yacht container"
+            return 1
+        fi
+    else
+        gum style --foreground 1 "❌ Restore not yet implemented for this container type"
+        return 1
+    fi
+    
+    while IFS=':' read -r source dest; do
+        if [ -n "$source" ] && [ -n "$dest" ]; then
+            VOLUME_NAME=$(basename "$source")
+            if [ -f "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" ] &&
+               [[ "$source" != "/var/run/docker.sock" ]] &&
+               [[ "$source" != "/var/run/"* ]]; then
+                gum style --foreground 4 "📁 Restoring volume: $VOLUME_NAME"
+                sudo mkdir -p "$source"
+                sudo tar xzf "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" -C "$source"
+            fi
+        fi
+    done < <(sudo cat "$BACKUP_DIR/volumes.txt" | tr ';' '\n')
+    
+    gum style --foreground 2 "✅ Container restore completed"
+    gum style --foreground 4 "📊 Container Status:"
+    docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | gum style --foreground 3
+    
+    return 0
+}
+
+backup_all_containers() {
+    gum style --foreground 4 "📦 Backing up all containers..."
+    local CONTAINERS
+    CONTAINERS=$(docker ps -a --format '{{.Names}}')
+    if [ -z "$CONTAINERS" ]; then
+        gum style --foreground 3 "No containers found."
+        return 1
+    fi
+
+    for c in $CONTAINERS; do
+        backup_single_container "$c"
+    done
+    gum style --foreground 2 "✅ All container backups completed."
+}
+
+###############################################################################
+# Docker Installation & Configuration
+###############################################################################
+docker_install_config_menu() {
+    CHOICE=$(gum choose \
+        "Check Docker Status" \
+        "Install / Reinstall Docker (includes Docker Compose)" \
+        "Install Yacht" \
+        "Configure Docker" \
+        "Change Docker Root Directory" \
+        "Back to Main Menu")
+
+    case "$CHOICE" in
+        "Check Docker Status")
+            check_docker_status
+            ;;
+        "Install / Reinstall Docker (includes Docker Compose)")
+            install_or_reinstall_docker
+            ;;
+        "Install Yacht")
+            install_yacht
+            ;;
+        "Configure Docker")
+            configure_docker
+            ;;
+        "Change Docker Root Directory")
+            change_docker_root
+            ;;
+        "Back to Main Menu")
+            show_main_menu
+            ;;
+    esac
+}
+
+# Check Docker Status
+check_docker_status() {
+    gum style --bold "🔍 Checking Docker installation..."
+
+    if command -v docker &>/dev/null; then
+        gum style --foreground 2 "✅ Docker binary found"
+        docker --version | gum style --foreground 4
+        
+        # Check Docker service
+        if systemctl is-active --quiet docker; then
+            gum style --foreground 2 "✅ Docker service is running"
+        else
+            gum style --foreground 1 "❌ Docker service is not running"
+            if gum confirm "Would you like to start Docker service?"; then
+                gum spin --spinner dot --title "Starting Docker service..." -- sudo systemctl start docker
+                gum style --foreground 2 "✅ Docker service started"
+            fi
+        fi
+    else
+        gum style --foreground 1 "❌ Docker is not installed"
+        if gum confirm "Would you like to install Docker now?"; then
+            install_or_reinstall_docker
+        fi
+    fi
+
+    gum confirm "Return to Docker Installation & Configuration?" && docker_install_config_menu || show_main_menu
+}
+
+# Combine "install_docker_debian" and "install_docker_compose" into one function
+install_or_reinstall_docker() {
+    gum style --border normal --border-foreground 212 "Install / Reinstall Docker & Docker Compose"
+
+    if command -v docker &>/dev/null; then
+        # If Docker is installed, offer to reinstall
+        if gum confirm "Docker is already installed. Reinstall (this removes existing Docker data)?"; then
+            reinstall_docker
+        else
+            gum style --foreground 3 "Skipping reinstall. Checking if Docker Compose is installed..."
+            install_docker_compose_if_missing
+        fi
+    else
+        gum style --foreground 3 "Docker not found. Proceeding with a fresh install."
+        perform_docker_install
+        install_docker_compose_if_missing
+    fi
+
+    gum confirm "Return to Docker Installation & Configuration?" && docker_install_config_menu || show_main_menu
+}
+
+perform_docker_install() {
+    # Ask for sudo password
+    gum style --foreground 3 "🔐 Sudo access is required for Docker installation"
+    sudo -v
+    while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
+    # Cleanup if any partial docker is installed
+    gum style --foreground 4 "🧹 Removing partial Docker installations..."
+    sudo systemctl stop docker.socket docker.service containerd 2>/dev/null || true
+    sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras || true
+    sudo apt-get autoremove -y || true
+    sudo rm -rf /var/lib/docker /var/lib/containerd /etc/docker /var/run/docker.sock || true
+    sudo rm -rf /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d || true
+    sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg || true
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+
+    gum style --foreground 4 "📦 Installing prerequisites..."
+    if ! sudo apt-get update; then
+        fatal_error "Failed to update apt repository"
+    fi
+    if ! sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release \
+        apt-transport-https \
+        software-properties-common; then
+        fatal_error "Failed to install required packages"
+    fi
+
+    gum style --foreground 4 "🔑 Adding Docker's official GPG key..."
+    sudo install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg || fatal_error "Failed to download Docker GPG key"
+    sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+    gum style --foreground 4 "📝 Setting up Docker repository..."
+    echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+        sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    gum style --foreground 4 "🐳 Installing Docker Engine..."
+    if ! sudo apt-get update; then
+        fatal_error "Failed to update apt after adding Docker repo"
+    fi
+    if ! sudo apt-get install -y \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin; then
+        fatal_error "Failed to install Docker packages"
+    fi
+
+    # Configure containerd
+    gum style --foreground 4 "⚙️  Configuring containerd..."
+    sudo mkdir -p /etc/containerd
+    containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+    sudo systemctl restart containerd
+
+    # Start and enable Docker
+    gum style --foreground 4 "🔄 Starting Docker services..."
+    sudo systemctl enable containerd
+    sudo systemctl enable docker
+    sudo systemctl start containerd
+    sudo systemctl start docker
+
+    # Verify
+    if ! docker --version; then
+        fatal_error "Docker installation verification failed"
+    fi
+
+    # Prompt to add user to docker group
+    if gum confirm "Add current user to docker group for non-root access?"; then
+        if ! sudo usermod -aG docker "$USER"; then
+            fatal_error "Failed to add user to docker group"
+        fi
+        gum style --foreground 2 "✅ User added to docker group"
+        gum style --foreground 3 "⚠️  Please log out and back in (or run 'newgrp docker') for group changes to take effect"
+    fi
+
+    gum style --foreground 2 "✅ Docker installation completed successfully"
+    docker --version | gum style --foreground 4
+}
+
+install_docker_compose_if_missing() {
+    if command -v docker-compose &>/dev/null; then
+        gum style --foreground 2 "Docker Compose is already installed."
+        docker-compose --version | gum style --foreground 4
+        return
+    else
+        gum style --foreground 3 "Docker Compose (docker-compose) is not detected. Installing..."
+    fi
+
+    # Check the plugin-based compose first
+    if command -v docker &>/dev/null && docker compose version &>/dev/null; then
+        gum style --foreground 2 "✅ The Docker Compose plugin is already installed"
+        docker compose version | gum style --foreground 4
+        return
+    fi
+
+    gum style --foreground 4 "🔍 Checking latest Docker Compose version..."
+    COMPOSE_VERSION=$(curl -s https://api.github.com/repos/docker/compose/releases/latest | grep "tag_name" | cut -d '"' -f 4)
+    if [ -z "$COMPOSE_VERSION" ]; then
+        fatal_error "Failed to determine latest Docker Compose version"
+    fi
+
+    gum style --foreground 4 "📥 Downloading Docker Compose $COMPOSE_VERSION..."
+    if ! sudo curl -L \
+        "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" \
+        -o /usr/local/bin/docker-compose; then
+        fatal_error "Failed to download Docker Compose binary"
+    fi
+
+    gum style --foreground 4 "📝 Setting permissions..."
+    if ! sudo chmod +x /usr/local/bin/docker-compose; then
+        fatal_error "Failed to set docker-compose as executable"
+    fi
+
+    gum style --foreground 2 "✅ Docker Compose installed successfully"
+    /usr/local/bin/docker-compose --version | gum style --foreground 4
+}
+
+reinstall_docker() {
+    gum style --border normal --border-foreground 212 "Reinstalling Docker"
+
+    if ! gum confirm "⚠️  This will remove Docker and all its data. Continue?"; then
+        return 1
+    fi
+
+    gum style --foreground 3 "🧹 Removing existing Docker installation..."
+    sudo systemctl stop docker.socket docker.service containerd 2>/dev/null || true
+    if ! sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras; then
+        fatal_error "Failed to remove existing Docker packages"
+    fi
+    sudo rm -rf /var/lib/docker /var/lib/containerd /etc/docker /var/run/docker.sock
+    sudo rm -rf /etc/systemd/system/docker.service.d /etc/systemd/system/containerd.service.d
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+
+    # Install fresh Docker
+    perform_docker_install
+    install_docker_compose_if_missing
+    gum style --foreground 2 "✅ Docker reinstalled successfully"
+}
+
+###############################################################################
+# Advanced / System Tools Menu
+###############################################################################
+advanced_system_tools_menu() {
+    CHOICE=$(gum choose \
+        "Show Docker Paths" \
+        "Setup Docker Networks" \
+        "Setup Docker Volumes" \
+        "Back to Main Menu")
+
+    case "$CHOICE" in
+        "Show Docker Paths")
+            show_docker_paths
+            ;;
+        "Setup Docker Networks")
+            setup_docker_networks
+            ;;
+        "Setup Docker Volumes")
+            setup_docker_volumes
+            ;;
+        "Back to Main Menu")
+            show_main_menu
+            ;;
+    esac
+}
+
+show_docker_paths() {
+    gum style --border normal --border-foreground 212 "Docker Data Locations"
+    
+    PATHS=(
+        "/var/lib/docker:Main Docker root directory"
+        "/var/lib/docker/containers:Container data"
+        "/var/lib/docker/volumes:Named volumes"
+        "/var/lib/docker/overlay2:Layer storage"
+        "/var/lib/docker/image:Images"
+        "/var/lib/docker/network:Network configurations"
+        "/var/lib/docker/buildkit:BuildKit state"
+        "/etc/docker:Docker configuration"
+    )
+
+    printf "%-40s %-15s %s\n" "LOCATION" "SIZE" "DESCRIPTION" | gum style --foreground 4
+    echo "--------------------------------------------------------------------------------"
+
+    for PATH_INFO in "${PATHS[@]}"; do
+        PATH_LOC="${PATH_INFO%%:*}"
+        DESC="${PATH_INFO#*:}"
+        
+        if [ -d "$PATH_LOC" ] || [ -f "$PATH_LOC" ]; then
+            SIZE=$(du -sh "$PATH_LOC" 2>/dev/null | cut -f1)
+            printf "%-40s %-15s %s\n" "$PATH_LOC" "$SIZE" "$DESC" | gum style --foreground 2
+        else
+            printf "%-40s %-15s %s\n" "$PATH_LOC" "not found" "$DESC" | gum style --foreground 1
+        fi
+    done
+
+    echo
+    gum style --foreground 3 "Note: You might need sudo rights to view some directories"
+    
+    if gum confirm "Would you like to see detailed disk usage?"; then
+        echo
+        gum style --foreground 4 "Detailed disk usage (this might take a moment)..."
+        sudo du -h --max-depth=1 /var/lib/docker/ 2>/dev/null | sort -hr | gum table
+    fi
+
+    gum confirm "Return to Advanced / System Tools?" && advanced_system_tools_menu || show_main_menu
+}
+
+setup_docker_networks() {
+    gum style --foreground 3 "Coming soon..."
+    gum confirm "Return to Advanced / System Tools?" && advanced_system_tools_menu || show_main_menu
+}
+
+setup_docker_volumes() {
+    gum style --foreground 3 "Coming soon..."
+    gum confirm "Return to Advanced / System Tools?" && advanced_system_tools_menu || show_main_menu
+}
+
+###############################################################################
+# Docker Backup & Restore Helpers
+###############################################################################
+# (begin system-level backup code, which you already have in the snippet)
+
+# Snapshots (btrfs, zfs, lvm) logic
+create_docker_snapshot() {
+    local MOUNT_POINT="$1"
+    local SNAPSHOT_PATH="$2"
+    
+    local FS_TYPE
+    FS_TYPE=$(df -T "$MOUNT_POINT" | tail -n 1 | awk '{print $2}')
+    
+    case "$FS_TYPE" in
+        "btrfs")
+            gum style --foreground 4 "📸 Creating Btrfs snapshot..."
+            sudo btrfs subvolume snapshot -r "$MOUNT_POINT" "$SNAPSHOT_PATH"
+            echo "btrfs"
+            ;;
+        "zfs")
+            gum style --foreground 4 "📸 Creating ZFS snapshot..."
+            local DATASET
+            DATASET=$(zfs list -H -o name "$MOUNT_POINT")
+            sudo zfs snapshot "${DATASET}@backup_$(date +%Y%m%d_%H%M%S)"
+            echo "zfs"
+            ;;
+        "lvm")
+            gum style --foreground 4 "📸 Creating LVM snapshot..."
+            local VG_LV
+            VG_LV=$(lvdisplay | grep "LV Path" | grep docker | awk '{print $3}')
+            sudo lvcreate -L10G -s -n docker_snapshot "$VG_LV"
+            echo "lvm"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+remove_docker_snapshot() {
+    local SNAPSHOT_PATH="$1"
+    local FS_TYPE="$2"
+    
+    case "$FS_TYPE" in
+        "btrfs")
+            sudo btrfs subvolume delete "$SNAPSHOT_PATH"
+            ;;
+        "zfs")
+            # For simplicity, we didn't store the dataset name. Just an example:
+            # If you adapt it, keep track of dataset in a variable.
+            gum style --foreground 3 "ZFS snapshot cleanup logic not fully implemented."
+            ;;
+        "lvm")
+            sudo lvremove -f /dev/docker_vg/docker_snapshot
+            ;;
+    esac
+}
+
+backup_docker_config() {
+    local BACKUP_DIR="/tmp/docker_backup_$(date +%Y%m%d_%H%M%S)"
+    local DOCKER_ROOT
+    DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+    local SNAPSHOT_PATH="${DOCKER_ROOT}_snapshot"
+    
+    gum style --foreground 4 "📦 Creating Docker configuration backup..."
+    
+    # Stop Docker services
+    gum style --foreground 4 "🛑 Stopping Docker services..."
+    sudo systemctl stop docker.socket docker.service
+    
+    # Create snapshot if possible
+    local FS_TYPE
+    FS_TYPE=$(create_docker_snapshot "$DOCKER_ROOT" "$SNAPSHOT_PATH")
+    
+    sudo mkdir -p "$BACKUP_DIR"
+    
+    local BACKUP_SOURCE
+    BACKUP_SOURCE=${FS_TYPE:+$SNAPSHOT_PATH}
+    BACKUP_SOURCE=${BACKUP_SOURCE:-$DOCKER_ROOT}
+    
+    sudo tar czf "$BACKUP_DIR/docker_data.tar.gz" -C "$BACKUP_SOURCE" .
+    
+    if [ -f "/etc/docker/daemon.json" ]; then
+        sudo cp -a "/etc/docker/daemon.json" "$BACKUP_DIR/"
+    fi
+    sudo cp -a "/etc/systemd/system/docker.service.d" "$BACKUP_DIR/" 2>/dev/null || true
+    sudo cp -a "/usr/lib/systemd/system/docker.service" "$BACKUP_DIR/" 2>/dev/null || true
+    
+    if [ -n "$FS_TYPE" ]; then
+        remove_docker_snapshot "$SNAPSHOT_PATH" "$FS_TYPE"
+    fi
+    
+    gum style --foreground 4 "🔄 Restarting Docker services..."
+    sudo systemctl start docker
+    
+    gum style --foreground 2 "✅ Backup created at: $BACKUP_DIR"
+}
+
+restore_docker_config() {
+    local DOCKER_ROOT
+    DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo "/var/lib/docker")
+
+    local BACKUP_DIR
+    BACKUP_DIR=$(gum input --placeholder "Path to your backup directory (e.g. /tmp/docker_backup_20230601_123456)")
+    if [ -z "$BACKUP_DIR" ]; then
+        gum style --foreground 1 "❌ No backup directory specified"
+        return 1
+    fi
+
+    if [ ! -d "$BACKUP_DIR" ]; then
+        gum style --foreground 1 "❌ Backup directory does not exist"
+        return 1
+    fi
+    
+    gum style --foreground 4 "🔄 Restoring Docker configuration..."
+    gum style --foreground 4 "🛑 Stopping Docker services..."
+    sudo systemctl stop docker.socket docker.service
+    
+    if [ -f "$BACKUP_DIR/daemon.json" ]; then
+        sudo cp -a "$BACKUP_DIR/daemon.json" "/etc/docker/daemon.json"
+    fi
+    sudo cp -a "$BACKUP_DIR/docker.service.d" "/etc/systemd/system/" 2>/dev/null || true
+    sudo cp -a "$BACKUP_DIR/docker.service" "/usr/lib/systemd/system/" 2>/dev/null || true
+
+    local CURRENT_BACKUP="${DOCKER_ROOT}_prerestore_$(date +%Y%m%d_%H%M%S)"
+    if [ -d "$DOCKER_ROOT" ]; then
+        gum style --foreground 4 "📦 Creating backup of current data at: $CURRENT_BACKUP"
+        sudo mv "$DOCKER_ROOT" "$CURRENT_BACKUP"
+    fi
+
+    sudo mkdir -p "$DOCKER_ROOT"
+    sudo chown root:root "$DOCKER_ROOT"
+    sudo chmod 710 "$DOCKER_ROOT"
+    
+    if [ -f "$BACKUP_DIR/docker_data.tar.gz" ]; then
+        gum style --foreground 4 "📦 Restoring Docker data..."
+        sudo tar xzf "$BACKUP_DIR/docker_data.tar.gz" -C "$DOCKER_ROOT"
+    fi
+
+    gum style --foreground 4 "🔄 Restarting Docker services..."
+    sudo systemctl daemon-reload
+    sudo systemctl start docker
+
+    if sudo docker info &>/dev/null; then
+        gum style --foreground 2 "✅ Docker restore completed successfully"
+        if gum confirm "Remove pre-restore backup at $CURRENT_BACKUP?"; then
+            sudo rm -rf "$CURRENT_BACKUP"
+        fi
+        return 0
+    else
+        gum style --foreground 1 "❌ Docker failed to start after restore"
+        gum style --foreground 3 "📑 Docker daemon logs:"
+        sudo journalctl -u docker.service -n 50 --no-pager | gum format
+        
+        if gum confirm "Rollback to previous state?"; then
+            sudo rm -rf "$DOCKER_ROOT"
+            sudo mv "$CURRENT_BACKUP" "$DOCKER_ROOT"
+            sudo systemctl restart docker
+        fi
+        return 1
+    fi
+}
+
+###############################################################################
+# Changing Docker Root Directory
+###############################################################################
+change_docker_root() {
+    if ! check_docker_change_state; then
+        return 1
+    fi
+
+    gum style --border normal --border-foreground 212 "Change Docker Root Directory"
+    
+    if ! sudo docker info &>/dev/null; then
+        gum style --foreground 1 "❌ Docker is not working properly"
+        if gum confirm "Would you like to try reinstalling Docker?"; then
+            reinstall_docker
+            return
+        fi
+        return 1
+    fi
+
+    CURRENT_ROOT=$(sudo docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+    if [ -z "$CURRENT_ROOT" ]; then
+        gum style --foreground 1 "❌ Failed to get Docker root directory"
+        if gum confirm "Would you like to try reinstalling Docker?"; then
+            reinstall_docker
+            return
+        fi
+        return 1
+    fi
+    gum style "Current Docker root directory: $CURRENT_ROOT"
+    
+    LOCATION_CHOICE=$(gum choose \
+        "Choose from common locations" \
+        "Enter custom location" \
+        "Cancel")
+
+    case "$LOCATION_CHOICE" in
+        "Choose from common locations")
+            NEW_ROOT=$(gum choose \
+                "/var/lib/docker     (Default location)" \
+                "/data/docker        (Separate data partition)" \
+                "/home/docker        (Home directory)" \
+                "/opt/docker         (Optional software)" \
+                "/mnt/docker         (Mounted volume)" \
+                | cut -d' ' -f1)
+            ;;
+        "Enter custom location")
+            NEW_ROOT=$(gum input --placeholder "/path/to/new/docker/root")
+            ;;
+        "Cancel")
+            return
+            ;;
+    esac
+    
+    if [ -z "$NEW_ROOT" ]; then
+        gum style --foreground 1 "❌ No directory specified"
+        return 1
+    fi
+
+    AVAILABLE_SPACE=$(sudo df -h "$NEW_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+    CURRENT_USAGE=$(sudo du -sh "$CURRENT_ROOT" 2>/dev/null | cut -f1)
+    
+    gum style --foreground 3 "📊 Space Analysis:"
+    echo "Current Docker data size: $CURRENT_USAGE"
+    echo "Available space at new location: $AVAILABLE_SPACE"
+
+    gum confirm "Are you sure you want to move Docker root to $NEW_ROOT?" || return
+    gum style --foreground 4 "🔍 Verifying directories..."
+    echo "Current root exists: $(if [ -d "$CURRENT_ROOT" ]; then echo "yes"; else echo "no"; fi)"
+    echo "New root exists: $(if [ -d "$NEW_ROOT" ]; then echo "yes"; else echo "no"; fi)"
+    
+    gum style --foreground 4 "📂 Directory contents:"
+    echo "Current root ($CURRENT_ROOT):"
+    sudo ls -la "$CURRENT_ROOT" 2>&1
+    echo "New root ($NEW_ROOT):"
+    sudo ls -la "$NEW_ROOT" 2>&1
+    
+    if ! gum confirm "Continue with directory change?"; then
+        return 1
+    fi
+
+    gum style --foreground 3 "🛑 Stopping Docker service..."
+    sudo systemctl stop docker.socket docker.service || fatal_error "Failed to stop Docker services"
+
+    if ! sudo mkdir -p "$NEW_ROOT"; then
+        fatal_error "Failed to create new directory $NEW_ROOT"
+    fi
+    sudo chown root:root "$NEW_ROOT"
+    sudo chmod 710 "$NEW_ROOT"
+
+    if [ -d "$CURRENT_ROOT" ] && [ "$(sudo ls -A "$CURRENT_ROOT" 2>/dev/null)" ]; then
+        gum style --foreground 4 "📦 Moving existing Docker data..."
+        if ! sudo rsync -aP "$CURRENT_ROOT/" "$NEW_ROOT/"; then
+            fatal_error "Failed to move Docker data to $NEW_ROOT"
+        fi
+        BACKUP_NAME="${CURRENT_ROOT}_backup_$(date +%Y%m%d_%H%M%S)"
+        gum style --foreground 4 "📁 Creating backup of old directory as $BACKUP_NAME..."
+        if ! sudo mv "$CURRENT_ROOT" "$BACKUP_NAME"; then
+            fatal_error "Failed to backup old directory"
+        fi
+    fi
+
+    gum style --foreground 4 "📝 Updating Docker configuration..."
+    DAEMON_CONFIG="/etc/docker/daemon.json"
+    echo '{
+  "data-root": "'"$NEW_ROOT"'"
+}' | sudo tee "$DAEMON_CONFIG" > /dev/null
+
+    sudo chown root:root "$DAEMON_CONFIG"
+    sudo chmod 644 "$DAEMON_CONFIG"
+
+    if ! jq empty "$DAEMON_CONFIG" 2>/dev/null; then
+        gum style --foreground 1 "❌ Invalid JSON syntax in daemon.json"
+        gum style --foreground 3 "Current content:"
+        sudo cat "$DAEMON_CONFIG" | gum format
+        return 1
+    fi
+
+    save_docker_change_state "$CURRENT_ROOT" "$NEW_ROOT"
+
+    gum style --foreground 4 "🔄 Starting Docker service..."
+    sudo systemctl restart containerd
+    sleep 2
+    if ! sudo systemctl start docker; then
+        gum style --foreground 1 "❌ Failed to start Docker service"
+        if sudo docker info &>/dev/null; then
+            gum style --foreground 2 "✅ Docker root directory change appears functional, but check perms."
+            save_docker_change_state "$CURRENT_ROOT" "$NEW_ROOT"
+            if gum confirm "Would you like to activate group membership now?"; then
+                exec newgrp docker <<EOF
+                $0
+EOF
+            else
+                gum style --foreground 3 "Log out and back in or run 'newgrp docker' to use Docker without sudo."
+            fi
+            return 0
+        else
+            gum style --foreground 3 "📑 Docker daemon logs:"
+            sudo journalctl -u docker.service -n 50 --no-pager | gum format
+
+            local ACTION
+            ACTION=$(gum choose \
+                "Show full Docker logs" \
+                "Try with SELinux disabled" \
+                "Restore previous configuration" \
+                "Reinstall Docker" \
+                "Cancel")
+
+            case "$ACTION" in
+                "Show full Docker logs")
+                    sudo journalctl -u docker.service --no-pager | gum pager
+                    ;;
+                "Try with SELinux disabled")
+                    gum style --foreground 4 "🔧 Attempting to start Docker with SELinux disabled..."
+                    if [ -f "/etc/docker/daemon.json" ]; then
+                        sudo sed -i 's/}/,\n  "selinux-enabled": false\n}/' /etc/docker/daemon.json
+                    else
+                        echo '{"selinux-enabled": false}' | sudo tee /etc/docker/daemon.json
+                    fi
+                    sudo systemctl restart docker
+                    ;;
+                "Restore previous configuration")
+                    gum style --foreground 4 "🔄 Restoring previous configuration..."
+                    sudo mv "$BACKUP_NAME" "$CURRENT_ROOT"
+                    sudo sed -i "s|\"data-root\": \".*\"|\"data-root\": \"$CURRENT_ROOT\"|" "$DAEMON_CONFIG"
+                    sudo systemctl restart containerd
+                    sleep 2
+                    sudo systemctl restart docker
+                    ;;
+                "Reinstall Docker")
+                    reinstall_docker
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        fi
+    fi
+
+    # Verify
+    NEW_LOCATION=$(docker info --format '{{.DockerRootDir}}' || true)
+    if [ "$NEW_LOCATION" = "$NEW_ROOT" ]; then
+        gum style --foreground 2 "✅ Docker root directory successfully changed to $NEW_ROOT"
+    else
+        gum style --foreground 1 "❌ Failed to change Docker root directory"
+        gum style --foreground 3 "Current location: $NEW_LOCATION"
+    fi
+
+    gum confirm "Return to Main Menu?" && show_main_menu || exit 0
+}
+
+###############################################################################
+# Install Yacht
+###############################################################################
+install_yacht() {
+    gum style --border normal --border-foreground 212 "🚀 Installing Yacht - Docker Management UI"
+
+    if docker ps -a --format '{{.Names}}' | grep -q "^yacht$"; then
+        gum style --foreground 3 "⚠️  Yacht is already installed"
+        CURRENT_PORT=$(docker port yacht 8000/tcp 2>/dev/null | cut -d':' -f2 || true)
+        
+        gum style --border normal --border-foreground 2 --margin "1" --padding "1" "
+🌐 Yacht is running and available at:
+   http://localhost:${CURRENT_PORT}
+   http://127.0.0.1:${CURRENT_PORT}
+   http://$(hostname):${CURRENT_PORT}
+$(ip -4 addr | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | while read -r ip; do echo "   http://${ip}:${CURRENT_PORT}"; done)
+"
+        
+        if gum confirm "Would you like to remove it and reinstall?"; then
+            docker rm -f yacht
+            docker volume rm yacht
+        else
+            return
+        fi
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        gum style --foreground 1 "❌ Docker not installed. Please install Docker first."
+        return 1
+    fi
+
+    DEFAULT_PORT="8000"
+    PORT=$(gum input --placeholder "Enter port number (default: ${DEFAULT_PORT})" --value "${DEFAULT_PORT}")
+    [ -z "$PORT" ] && PORT="${DEFAULT_PORT}"
+
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        gum style --foreground 1 "❌ Invalid port number"
+        return 1
+    fi
+
+    if command -v netstat &>/dev/null && netstat -tuln 2>/dev/null | grep -q ":${PORT} "; then
+        gum style --foreground 1 "❌ Port ${PORT} is already in use"
+        return 1
+    fi
+
+    gum style --foreground 4 "📦 Creating Yacht volume..."
+    if ! docker volume create yacht; then
+        gum style --foreground 1 "❌ Failed to create Yacht volume"
+        return 1
+    fi
+
+    gum style --foreground 4 "🚀 Starting Yacht container..."
+    if ! docker run -d \
+        -p "${PORT}:8000" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v yacht:/config \
+        --name yacht \
+        --restart unless-stopped \
+        selfhostedpro/yacht; then
+        gum style --foreground 1 "❌ Failed to start Yacht container"
+        return 1
+    fi
+
+    gum spin --spinner dot --title "Waiting for Yacht to start..." -- sleep 5
+
+    if ! docker ps --format '{{.Names}}' | grep -q "^yacht$"; then
+        gum style --foreground 1 "❌ Yacht container failed to start"
+        return 1
+    fi
+
+    gum style --border normal --border-foreground 2 --margin "1" --padding "1" "
+✅ Yacht installed successfully!
+
+🌐 Access Yacht at:
+   http://localhost:${PORT}
+   http://127.0.0.1:${PORT}
+   http://$(hostname):${PORT}
+$(ip -4 addr | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | while read -r ip; do echo "   http://${ip}:${PORT}"; done)
+
+🔑 Default Login Credentials:
+   Username: admin@yacht.local
+   Password: pass
+
+⚠️  IMPORTANT: Please change your password immediately after logging in:
+   1. Click on 'admin' in the top right
+   2. Select 'User'
+   3. Click 'Change Password' in the top menu
+   4. You can also change your username in this section
+"
+
+    gum confirm "Return to Docker Installation & Configuration?" && docker_install_config_menu || show_main_menu
+}
+
+###############################################################################
+# Script Execution Starts Here
+###############################################################################
+show_main_menu
+    if [ "$NEW_LOCATION" = "$NEW_ROOT" ]; then
+        gum style --foreground 2 "✅ Docker root directory successfully changed to $NEW_ROOT"
+    else
+        gum style --foreground 1 "❌ Failed to change Docker root directory"
+        gum style --foreground 3 "Current location: $NEW_LOCATION"
+    fi
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# New function to install Yacht
+install_yacht() {
+    gum style --border normal --border-foreground 212 "🚀 Installing Yacht - Docker Management UI"
+
+    # Check if Yacht is already installed
+    if docker ps -a --format '{{.Names}}' | grep -q "^yacht$"; then
+        gum style --foreground 3 "⚠️  Yacht is already installed"
+        
+        # Get the current port
+        CURRENT_PORT=$(docker port yacht 8000/tcp 2>/dev/null | cut -d':' -f2 || true)
+        
+        # Show current access URLs
+        gum style --border normal --border-foreground 2 --margin "1" --padding "1" "
+🌐 Yacht is running and available at:
+   http://localhost:${CURRENT_PORT}
+   http://127.0.0.1:${CURRENT_PORT}
+   http://$(hostname):${CURRENT_PORT}
+$(ip -4 addr | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | while read -r ip; do echo "   http://${ip}:${CURRENT_PORT}"; done)
+"
+        
+        if gum confirm "Would you like to remove it and reinstall?"; then
+            docker rm -f yacht
+            docker volume rm yacht
+        else
+            return
+        fi
+    fi
+
+    # Get Docker root directory
+    DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}')
+    
+    # Ask for port number
+    DEFAULT_PORT="8000"
+    PORT=$(gum input --placeholder "Enter port number (default: ${DEFAULT_PORT})" --value "${DEFAULT_PORT}")
+    if [ -z "$PORT" ]; then
+        PORT="${DEFAULT_PORT}"
+    fi
+
+    # (Optional) Validate port number
+    if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+        gum style --foreground 1 "❌ Invalid port number"
+        return 1
+    fi
+
+    # Verify port is available (requires netstat)
+    if netstat -tuln 2>/dev/null | grep -q ":${PORT} "; then
+        gum style --foreground 1 "❌ Port ${PORT} is already in use"
+        return 1
+    fi
+
+    # Create volume
+    gum style --foreground 4 "📦 Creating Yacht volume..."
+    if ! docker volume create yacht; then
+        gum style --foreground 1 "❌ Failed to create Yacht volume"
+        return 1
+    fi
+
+    # Start Yacht container
+    gum style --foreground 4 "🚀 Starting Yacht container..."
+    if ! docker run -d \
+        -p "${PORT}:8000" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v yacht:/config \
+        --name yacht \
+        --restart unless-stopped \
+        selfhostedpro/yacht; then
+        gum style --foreground 1 "❌ Failed to start Yacht container"
+        return 1
+    fi
+
+    # Wait for container to start
+    gum spin --spinner dot --title "Waiting for Yacht to start..." -- sleep 5
+
+    # Check if container is running
+    if ! docker ps --format '{{.Names}}' | grep -q "^yacht$"; then
+        gum style --foreground 1 "❌ Yacht container failed to start"
+        return 1
+    fi
+
+    # Show success message with all possible URLs
+    gum style --border normal --border-foreground 2 --margin "1" --padding "1" "
+✅ Yacht installed successfully!
+
+🌐 Access Yacht at:
+   http://localhost:${PORT}
+   http://127.0.0.1:${PORT}
+   http://$(hostname):${PORT}
+$(ip -4 addr | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | while read -r ip; do echo "   http://${ip}:${PORT}"; done)
+
+🔑 Default Login Credentials:
+   Username: admin@yacht.local
+   Password: pass
+
+⚠️  IMPORTANT: Please change your password immediately after logging in:
+   1. Click on 'admin' in the top right
+   2. Select 'User'
+   3. Click 'Change Password' in the top menu
+   4. You can also change your username in this section
+"
+
+    gum confirm "Return to Docker Setup?" && docker_setup || show_main_menu
+}
+
+# New function for Docker reinstallation
+reinstall_docker() {
+    gum style --border normal --border-foreground 212 "Reinstalling Docker"
+    
+    # Confirm reinstallation
+    if ! gum confirm "⚠️  This will remove Docker and all its data. Continue?"; then
+        return 1
+    fi
+
+    # Force removal of existing Docker installation
+    gum style --foreground 3 "🧹 Removing existing Docker installation..."
+    
+    # Stop services first
+    sudo systemctl stop docker.socket docker.service containerd 2>/dev/null
+    
+    # Remove packages
+    if ! sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras; then
+        fatal_error "Failed to remove existing Docker packages"
+    fi
+    
+    # Clean up files
+    sudo rm -rf /var/lib/docker
+    sudo rm -rf /var/lib/containerd
+    sudo rm -rf /etc/docker
+    sudo rm -rf /var/run/docker.sock
+    sudo rm -rf /etc/systemd/system/docker.service.d
+    sudo rm -rf /etc/systemd/system/containerd.service.d
+    
+    # Reset systemd
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed
+
+    # Install fresh Docker
+    if install_docker; then
+        gum style --foreground 2 "✅ Docker reinstalled successfully"
+        return 0
+    else
+        gum style --foreground 1 "❌ Docker reinstallation failed"
+        return 1
+    fi
+}
+
+# New function for Docker backup/restore menu
+docker_backup_restore() {
+    gum style --border normal --border-foreground 212 "Docker Backup & Restore"
+    
+    ACTION=$(gum choose \
+        "Backup Container" \
+        "Restore Container" \
+        "Backup All Containers" \
+        "System Backup" \
+        "System Restore" \
+        "List Backups" \
+        "Delete Backup" \
+        "Back")
+
+    case "$ACTION" in
+        "Backup Container")
+            # Select container to backup
+            CONTAINER=$(docker ps -a --format "{{.Names}}" | gum filter --placeholder "Choose container to backup...")
+            if [ -n "$CONTAINER" ]; then
+                backup_single_container "$CONTAINER"
+            fi
+            ;;
+        "Restore Container")
+            # First check if backup directory exists
+            if [ ! -d "/tmp/docker_backups" ]; then
+                gum style --foreground 1 "❌ No backup directory found"
+                return 1
+            fi
+            
+            # List all container backups with their timestamps
+            BACKUPS=()
+            while IFS= read -r -d '' dir; do
+                CONTAINER_NAME=$(basename "$(dirname "$dir")")
+                TIMESTAMP=$(basename "$dir")
+                BACKUPS+=("$CONTAINER_NAME - $TIMESTAMP")
+            done < <(find /tmp/docker_backups -mindepth 2 -maxdepth 2 -type d -print0)
+            
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No container backups found"
+                return 1
+            fi
+            
+            # Let user select backup
+            SELECTED=$(printf "%s\n" "${BACKUPS[@]}" | gum filter --placeholder "Select backup to restore...")
+            if [ -n "$SELECTED" ]; then
+                # Parse container name and timestamp from selection
+                CONTAINER_NAME=$(echo "$SELECTED" | cut -d' ' -f1)
+                TIMESTAMP=$(echo "$SELECTED" | cut -d' ' -f3)
+                BACKUP_PATH="/tmp/docker_backups/$CONTAINER_NAME/$TIMESTAMP"
+                
+                if [ -d "$BACKUP_PATH" ]; then
+                    restore_container_backup "$BACKUP_PATH/container.tar"
+                else
+                    gum style --foreground 1 "❌ Backup not found: $BACKUP_PATH"
+                    return 1
+                fi
+            fi
+            ;;
+        "Backup All Containers")
+            backup_all_containers
+            ;;
+        "System Backup")
+            backup_docker_config
+            ;;
+        "System Restore")
+            restore_docker_config
+            ;;
+        "List Backups")
+            BACKUPS=( $(ls -d /tmp/docker_backup_* 2>/dev/null) )
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No backups found"
+            else
+                gum style --foreground 4 "📂 Available backups:"
+                for backup in "${BACKUPS[@]}"; do
+                    echo "Created: $(date -r "$backup" "+%Y-%m-%d %H:%M:%S") - $backup"
+                done | gum table
+            fi
+            ;;
+        "Delete Backup")
+            BACKUPS=( $(ls -d /tmp/docker_backup_* 2>/dev/null) )
+            if [ ${#BACKUPS[@]} -eq 0 ]; then
+                gum style --foreground 1 "❌ No backups found"
+                return 1
+            fi
+            
+            SELECTED_BACKUP=$(printf "%s\n" "${BACKUPS[@]}" | gum choose --header "Select backup to delete:")
+            if [ -n "$SELECTED_BACKUP" ]; then
+                if gum confirm "Are you sure you want to delete this backup?"; then
+                    if sudo rm -rf "$SELECTED_BACKUP"; then
+                        gum style --foreground 2 "✅ Backup deleted successfully"
+                    else
+                        gum style --foreground 1 "❌ Failed to delete backup"
+                    fi
+                fi
+            fi
+            ;;
+        "Back")
+            docker_setup
+            return
+            ;;
+    esac
+
+    gum confirm "Return to Backup & Restore menu?" && docker_backup_restore || docker_setup
+}
+
+# Function to backup a single container
+backup_single_container() {
+    local CONTAINER="$1"
+    local BACKUP_DIR="/tmp/docker_backups/$CONTAINER/$(date +%Y%m%d_%H%M%S)"
+    
+    gum style --foreground 4 "📦 Backing up container: $CONTAINER"
+    
+    # Create backup directory with proper permissions
+    sudo mkdir -p "$BACKUP_DIR"
+    sudo chown $USER:$USER "$BACKUP_DIR"
+    
+    # Get container info
+    docker inspect "$CONTAINER" | sudo tee "$BACKUP_DIR/container_info.json" > /dev/null
+    
+    # Get container image
+    docker inspect --format='{{.Config.Image}}' "$CONTAINER" | sudo tee "$BACKUP_DIR/image_name" > /dev/null
+    
+    # List volumes (excluding system volumes)
+    docker inspect --format='{{range .Mounts}}{{if ne .Source "/var/run/docker.sock"}}{{.Source}}:{{.Destination}};{{end}}{{end}}' "$CONTAINER" | \
+        sudo tee "$BACKUP_DIR/volumes.txt" > /dev/null
+    
+    # Backup volumes
+    while IFS=':' read -r source dest; do
+        if [ -n "$source" ] && [ -n "$dest" ]; then
+            VOLUME_NAME=$(basename "$source")
+            # Skip system volumes and special files
+            if [[ "$source" == "/var/run/docker.sock" ]] || [[ "$source" == "/var/run/"* ]]; then
+                gum style --foreground 3 "⚠️  Skipping system volume: $source"
+                continue
+            fi
+            gum style --foreground 4 "📁 Backing up volume: $VOLUME_NAME"
+            sudo tar czf "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" -C "$source" .
+        fi
+    done < <(sudo cat "$BACKUP_DIR/volumes.txt" | tr ';' '\n')
+    
+    # Create container backup
+    gum style --foreground 4 "💾 Creating container backup..."
+    docker export "$CONTAINER" | sudo tee "$BACKUP_DIR/container.tar" > /dev/null
+    
+    # Set proper permissions on all files
+    sudo chown -R $USER:$USER "$BACKUP_DIR"
+    
+    gum style --foreground 2 "✅ Backup completed: $BACKUP_DIR"
+}
+
+# Function to restore a container backup
+restore_container_backup() {
+    local BACKUP_PATH="$1"
+    local BACKUP_DIR
+    BACKUP_DIR=$(dirname "$BACKUP_PATH")
+    local CONTAINER_NAME
+    CONTAINER_NAME=$(basename "$(dirname "$BACKUP_DIR")")
+    
+    gum style --foreground 4 "🔄 Restoring container: $CONTAINER_NAME"
+    
+    # Load original container configuration
+    local CONTAINER_CONFIG
+    CONTAINER_CONFIG=$(sudo cat "$BACKUP_DIR/container_info.json")
+    local IMAGE
+    IMAGE=$(echo "$CONTAINER_CONFIG" | jq -r '.[0].Config.Image')
+    
+    # Check if container exists and remove if confirmed
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        if gum confirm "Container exists. Remove it?"; then
+            sudo docker rm -f "$CONTAINER_NAME"
+        else
+            return 1
+        fi
+    fi
+    
+    # Pull image if needed
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        gum style --foreground 4 "📥 Pulling image: $IMAGE"
+        sudo docker pull "$IMAGE"
+    fi
+    
+    # For Yacht container, use the known working configuration
+    if [[ "$IMAGE" == "selfhostedpro/yacht" ]]; then
+        gum style --foreground 4 "📦 Restoring Yacht container..."
+        if ! sudo docker run -d \
+            -p 8000:8000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v yacht:/config \
+            --name yacht \
+            --restart unless-stopped \
+            selfhostedpro/yacht; then
+            gum style --foreground 1 "❌ Failed to restore Yacht container"
+            return 1
+        fi
+    else
+        # For other containers, use the backup configuration
+        # (Add handling for other container types here)
+        gum style --foreground 1 "❌ Restore not yet implemented for this container type"
+        return 1
+    fi
+    
+    # Restore volumes if any
+    while IFS=':' read -r source dest; do
+        if [ -n "$source" ] && [ -n "$dest" ]; then
+            VOLUME_NAME=$(basename "$source")
+            if [ -f "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" ] && \
+               [[ "$source" != "/var/run/docker.sock" ]] && \
+               [[ "$source" != "/var/run/"* ]]; then
+                gum style --foreground 4 "📁 Restoring volume: $VOLUME_NAME"
+                sudo mkdir -p "$source"
+                sudo tar xzf "$BACKUP_DIR/${VOLUME_NAME}.tar.gz" -C "$source"
+            fi
+        fi
+    done < <(sudo cat "$BACKUP_DIR/volumes.txt" | tr ';' '\n')
+    
+    gum style --foreground 2 "✅ Container restore completed"
+    
+    # Show container status
+    gum style --foreground 4 "📊 Container Status:"
+    docker ps --filter "name=$CONTAINER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | \
+        gum style --foreground 3
+    
+    return 0
+}
+
+# Backup all containers
+backup_all_containers() {
+    gum style --foreground 4 "📦 Backing up all containers..."
+    local CONTAINERS
+    CONTAINERS=$(docker ps -a --format '{{.Names}}')
+    if [ -z "$CONTAINERS" ]; then
+        gum style --foreground 3 "No containers found."
+        return 1
+    fi
+
+    for c in $CONTAINERS; do
+        backup_single_container "$c"
+    done
+    gum style --foreground 2 "✅ All container backups completed."
+}
+
+# Start the application
+show_main_menu

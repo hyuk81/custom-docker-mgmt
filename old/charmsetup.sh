@@ -1,6 +1,14 @@
 #!/bin/bash
 
-echo "🎀 Setting up Charm tools..."
+# Get the directory where the script is located
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# Get the root directory of the project (parent of scripts directory)
+PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+
+# Change to project root directory
+cd "$PROJECT_ROOT" || exit 1
+
+echo "🎀 Setting up Charm tools from $(pwd)..."
 
 install_go_debian_ubuntu() {
     echo "📦 Installing Go on Debian/Ubuntu..."
