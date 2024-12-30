@@ -43,8 +43,8 @@ A comprehensive command-line tool for managing Docker containers, backups, and s
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
-   cd docker-management-tool
+   git clone https://github.com/yourusername/custom-docker-mgmt.git
+   cd custom-docker-mgmt
    ```
 
 2. Create a virtual environment:
@@ -63,6 +63,23 @@ A comprehensive command-line tool for managing Docker containers, backups, and s
 4. Make the script executable:
    ```bash
    chmod +x docker_manager.py
+   ```
+
+## Development Setup
+
+1. Install development dependencies:
+   ```bash
+   pip install -r requirements-dev.txt  # If you have additional dev dependencies
+   ```
+
+2. Set up pre-commit hooks:
+   ```bash
+   pre-commit install  # If you use pre-commit for code quality
+   ```
+
+3. Run tests:
+   ```bash
+   python -m pytest tests/  # If you have tests
    ```
 
 ## Usage
@@ -120,6 +137,11 @@ The tool stores:
    - Use System Tools to clean up resources
    - Check available space before operations
 
+4. **Python Environment Issues**
+   - Make sure to use Python 3.8 or higher
+   - Use `python3` command if `python` is not found
+   - Ensure all dependencies are installed correctly
+
 ## Contributing
 
 1. Fork the repository
@@ -128,6 +150,20 @@ The tool stores:
 4. Push to the branch
 5. Create a Pull Request
 
+### Development Guidelines
+
+- Follow PEP 8 style guide
+- Add docstrings for new functions
+- Update tests for new features
+- Keep commits atomic and well-documented
+
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Acknowledgments
+
+- Docker CLI for inspiration
+- Rich library for terminal UI
+- Textual library for file browsing
+- Typer for command-line interface
