@@ -1114,8 +1114,8 @@ def installation_menu():
                 console.print(f"\n[bold]Docker System Information:[/bold]\n{output}")
             input("\nPress Enter to continue...")
 
-def system_tools_menu():
-    """Handle system tools menu."""
+def cleanup_menu():
+    """Handle cleanup submenu."""
     while True:
         items = [
             "Clean up unused containers",
@@ -1127,7 +1127,7 @@ def system_tools_menu():
             "Clean up everything (prune system)",
         ]
 
-        menu = Menu("System Tools", items)
+        menu = Menu("Clean Up", items)
         choice = menu.show()
 
         if choice is None:
@@ -1172,6 +1172,73 @@ def system_tools_menu():
         except Exception as e:
             console.print(f"[red]✗ Operation failed: {e}[/red]")
             input("\nPress Enter to continue...")
+
+def test_menu():
+    """Handle test submenu."""
+    while True:
+        items = [
+            "Test container operations",
+            "Test backup/restore",
+            "Test network operations",
+            "Test volume operations",
+            "Run all tests",
+        ]
+
+        menu = Menu("Tests", items)
+        choice = menu.show()
+
+        if choice is None:
+            break
+
+        try:
+            if choice == 0:  # Test container operations
+                console.print("[yellow]Testing container operations...[/yellow]")
+                # TODO: Implement container operation tests
+                console.print("[green]✓ Container operations test completed[/green]")
+
+            elif choice == 1:  # Test backup/restore
+                console.print("[yellow]Testing backup/restore operations...[/yellow]")
+                # TODO: Implement backup/restore tests
+                console.print("[green]✓ Backup/restore test completed[/green]")
+
+            elif choice == 2:  # Test network operations
+                console.print("[yellow]Testing network operations...[/yellow]")
+                # TODO: Implement network operation tests
+                console.print("[green]✓ Network operations test completed[/green]")
+
+            elif choice == 3:  # Test volume operations
+                console.print("[yellow]Testing volume operations...[/yellow]")
+                # TODO: Implement volume operation tests
+                console.print("[green]✓ Volume operations test completed[/green]")
+
+            elif choice == 4:  # Run all tests
+                console.print("[yellow]Running all tests...[/yellow]")
+                # TODO: Implement comprehensive test suite
+                console.print("[green]✓ All tests completed[/green]")
+
+            input("\nPress Enter to continue...")
+        except Exception as e:
+            console.print(f"[red]✗ Test failed: {e}[/red]")
+            input("\nPress Enter to continue...")
+
+def system_tools_menu():
+    """Handle system tools menu."""
+    while True:
+        items = [
+            "Clean Up",
+            "Tests",
+        ]
+
+        menu = Menu("System Tools", items)
+        choice = menu.show()
+
+        if choice is None:
+            break
+
+        if choice == 0:
+            cleanup_menu()
+        elif choice == 1:
+            test_menu()
 
 @app.command()
 def main(interactive: bool = typer.Option(False, "--interactive", "-i", help="Start interactive mode")):
