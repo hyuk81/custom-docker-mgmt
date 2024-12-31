@@ -315,14 +315,20 @@ def installation_menu():
         
         try:
             if choice == 0:  # Check Docker installation
-                output = run_docker_command(['--version'])
-                if output:
-                    console.print(f"[green]✓ Docker is installed:[/green]\n{output}")
-                    output = run_docker_command(['info'])
-                    if output:
-                        console.print(f"\n[bold]Docker System Information:[/bold]\n{output}")
+                # Check Docker
+                docker_version = run_docker_command(['--version'])
+                if docker_version:
+                    console.print(f"[green]✓ Docker is installed:[/green] {docker_version}")
                 else:
-                    console.print("[yellow]Docker is not installed[/yellow]")
+                    console.print("[red]✗ Docker is not installed[/red]")
+
+                # Check Docker Compose
+                compose_version = run_docker_command(['compose', 'version'])
+                if compose_version:
+                    console.print(f"[green]✓ Docker Compose is installed:[/green] {compose_version}")
+                else:
+                    console.print("[red]✗ Docker Compose is not installed[/red]")
+
                 input("\nPress Enter to continue...")
 
             elif choice == 1:  # Install Docker
