@@ -5,21 +5,32 @@ A comprehensive command-line tool for managing Docker containers, backups, and s
 ## Features
 
 - **Container Operations**
+  - List all containers with status
   - Start, stop, and restart containers
-  - Delete containers with cleanup of associated resources
-  - Show detailed container information
-  - Manage container backups and restores
+  - Delete containers with optional volume cleanup
+  - Show detailed container information (ports, networks, mounts, size)
 
 - **Backup & Restore**
-  - Create container backups with volume data
-  - Restore containers from backups
-  - Browse and manage backup files
+  - Create container backups including:
+    - Container configuration
+    - Volume data (with proper permissions)
+    - Port mappings
+    - Environment variables
+    - Network settings
+    - Labels and other metadata
+  - Restore containers with:
+    - Original configuration
+    - Volume data
+    - Network settings
+    - Port mappings
+    - Environment variables
+    - Labels
   - Automatic backup naming with timestamps
+  - Safe volume handling during backup/restore
 
 - **Installation & Configuration**
   - Check Docker installation status
-  - Install Docker and Docker Compose
-  - Update Docker installation
+  - Install and configure Yacht (Docker Web UI)
   - Configure Docker daemon settings
   - Change Docker root directory
   - Configure user permissions
@@ -37,7 +48,7 @@ A comprehensive command-line tool for managing Docker containers, backups, and s
 
 - Python 3.8 or higher
 - Docker
-- sudo privileges
+- sudo privileges (for certain operations)
 
 ## Installation
 
@@ -62,85 +73,79 @@ A comprehensive command-line tool for managing Docker containers, backups, and s
 
 4. Make the script executable:
    ```bash
-   chmod +x docker_manager.py
-   ```
-
-## Development Setup
-
-1. Install development dependencies:
-   ```bash
-   pip install -r requirements-dev.txt  # If you have additional dev dependencies
-   ```
-
-2. Set up pre-commit hooks:
-   ```bash
-   pre-commit install  # If you use pre-commit for code quality
-   ```
-
-3. Run tests:
-   ```bash
-   python -m pytest tests/  # If you have tests
+   chmod +x docker-mgmt
    ```
 
 ## Usage
 
 Run the tool in interactive mode:
 ```bash
-./docker_manager.py --interactive
+./docker-mgmt --interactive
+# or
+python -m docker_mgmt --interactive
 ```
 
 ### Main Menu Options
 
 1. **Container Operations**
    - List and manage running containers
-   - Perform container-specific operations
+   - Start, stop, restart containers
+   - Delete containers with optional volume cleanup
+   - Show detailed container information
 
 2. **Backup & Restore**
-   - Create backups of containers with their data
-   - Restore containers from backups
-   - Browse backup files
+   - Create comprehensive backups of containers
+   - Restore containers with all original settings
+   - Manage backup files
+   - Safe volume handling
 
 3. **Installation & Config**
-   - Check and manage Docker installation
-   - Configure Docker daemon
-   - Change Docker root directory
-   - Manage user permissions
+   - Install and configure Yacht (Docker Web UI)
+   - Configure Docker settings
+   - Manage permissions
 
 4. **System Tools**
    - Clean up Docker resources
    - Show disk usage
-   - Perform system-wide cleanup
+   - System maintenance
 
-## Configuration
+## Data Storage
 
-The tool stores:
-- Backups in `~/.docker_backups/`
-- Docker configuration in `/etc/docker/daemon.json`
+- Backups are stored in `~/.docker_backups/`
+- Each backup includes:
+  - Container configuration (config.json)
+  - Volume data
+  - Complete container metadata
 
-## Security
+## Security Features
 
-- Requires sudo privileges for Docker operations
-- Handles sensitive operations with user confirmation
-- Validates paths and permissions before operations
+- Safe volume handling with read-only source mounts
+- Proper permission management for backups
+- Volume data preservation by default
+- Optional cleanup of sensitive data
+- Confirmation prompts for destructive operations
 
 ## Troubleshooting
 
-1. **Permission Denied**
-   - Ensure your user is in the docker group
-   - Run the tool with appropriate permissions
+1. **Permission Issues**
+   - The tool uses sudo only when necessary
+   - Volume operations are handled safely
+   - Proper ownership is maintained for backup files
 
 2. **Docker Not Running**
-   - Check Docker daemon status
-   - Use Installation & Config menu to fix issues
+   - Automatic Docker status check
+   - Clear error messages
+   - Guided resolution steps
 
-3. **Space Issues**
-   - Use System Tools to clean up resources
-   - Check available space before operations
+3. **Backup/Restore Issues**
+   - Volumes are preserved by default
+   - Clear prompts for data cleanup
+   - Safe handling of container states
 
-4. **Python Environment Issues**
-   - Make sure to use Python 3.8 or higher
-   - Use `python3` command if `python` is not found
-   - Ensure all dependencies are installed correctly
+4. **Container Management**
+   - Detailed container information
+   - Safe deletion with optional cleanup
+   - Proper handling of running containers
 
 ## Contributing
 
@@ -154,16 +159,10 @@ The tool stores:
 
 - Follow PEP 8 style guide
 - Add docstrings for new functions
-- Update tests for new features
-- Keep commits atomic and well-documented
+- Maintain proper error handling
+- Keep user interaction consistent
+- Preserve data safety features
 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Docker CLI for inspiration
-- Rich library for terminal UI
-- Textual library for file browsing
-- Typer for command-line interface

@@ -58,6 +58,51 @@ class DockerManager:
             console.print(f"[red]✗ Failed to restart container: {e}[/red]")
             return False
 
+    def delete_container(self, container_name: str) -> bool:
+        """Delete a container."""
+        try:
+            # Get container info before deletion to check for volumes
+            output = run_docker_command(['inspect', container_name])
+            if not output:
+                console.print(f"[red]Container {container_name} not found[/red]")
+                return False
+
+            container_info = json.loads(output)[0]
+            volumes = container_info.get('Mounts', [])
+            
+            if not Confirm.ask(f"[yellow]Are you sure you want to delete container {container_name}?[/yellow]"):
+                return False
+
+            # Remove the container
+            run_docker_command(['rm', '-f', container_name])
+            console.print(f"[green]✓ Container {container_name} deleted[/green]")
+
+            # After container deletion, ask about cleaning up volumes
+            volume_names = [v['Name'] for v in volumes if v.get('Type') == 'volume']
+            if volume_names:
+                console.print("\n[yellow]The following volumes were associated with this container:[/yellow]")
+                for name in volume_names:
+                    console.print(f"  - {name}")
+                console.print("[yellow]These volumes still contain data that might be needed later.[/yellow]")
+                
+                if Confirm.ask("[yellow]Would you like to clean up these volumes?[/yellow]"):
+                    for volume in volumes:
+                        if volume.get('Type') == 'volume':
+                            volume_name = volume.get('Name')
+                            if volume_name:
+                                try:
+                                    run_docker_command(['volume', 'rm', volume_name])
+                                    console.print(f"[green]✓ Volume {volume_name} removed[/green]")
+                                except Exception as e:
+                                    console.print(f"[red]✗ Failed to remove volume {volume_name}: {e}[/red]")
+                else:
+                    console.print("[green]Volumes have been kept for future use[/green]")
+
+            return True
+        except Exception as e:
+            console.print(f"[red]✗ Failed to delete container: {e}[/red]")
+            return False
+
     def list_containers(self) -> list:
         """List all containers."""
         try:
@@ -166,12 +211,15 @@ class DockerManager:
             backup_path = self.backup_dir / f"{container_name}_{timestamp}.tar"
 
             # Create temporary directory for backup
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                
+            temp_dir = "/tmp/docker_backup_temp"
+            subprocess.run(['sudo', 'rm', '-rf', temp_dir], check=True)
+            subprocess.run(['sudo', 'mkdir', '-p', temp_dir], check=True)
+            temp_path = Path(temp_dir)
+
+            try:
                 # Save container configuration
                 config_file = temp_path / "config.json"
-                config_file.write_text(output)
+                subprocess.run(['sudo', 'bash', '-c', f'echo \'{output}\' > {config_file}'], check=True)
 
                 # Get container volumes
                 container_info = json.loads(output)[0]
@@ -179,7 +227,7 @@ class DockerManager:
                 
                 if volumes:
                     volumes_dir = temp_path / "volumes"
-                    volumes_dir.mkdir()
+                    subprocess.run(['sudo', 'mkdir', '-p', str(volumes_dir)], check=True)
                     
                     # Stop container temporarily for consistent backup
                     console.print("[yellow]Stopping container for backup...[/yellow]")
@@ -191,28 +239,35 @@ class DockerManager:
                                 volume_name = volume.get('Name')
                                 if volume_name:
                                     volume_dir = volumes_dir / volume_name
-                                    volume_dir.mkdir()
+                                    subprocess.run(['sudo', 'mkdir', '-p', str(volume_dir)], check=True)
                                     
                                     # Use a temporary container to copy volume data
                                     console.print(f"Backing up volume: {volume_name}")
                                     run_docker_command([
                                         'run', '--rm',
-                                        '-v', f"{volume_name}:/source",
-                                        '-v', f"{volume_dir}:/backup",
+                                        '-v', f"{volume_name}:/source:ro",  # Read-only source
+                                        '-v', f"{str(volume_dir)}:/backup",
                                         'alpine',
-                                        'cp', '-a', '/source/.', '/backup/'
+                                        'sh', '-c', 'cp -a /source/. /backup/ && chown -R root:root /backup/'
                                     ])
                     finally:
                         # Restart container
                         console.print("[yellow]Restarting container...[/yellow]")
                         run_docker_command(['start', container_name])
 
-                # Create tar archive
+                # Create tar archive with sudo
                 console.print("Creating backup archive...")
                 subprocess.run(
-                    ['tar', '-czf', str(backup_path), '-C', str(temp_path), '.'],
+                    ['sudo', 'tar', '-czf', str(backup_path), '-C', str(temp_path), '.'],
                     check=True
                 )
+
+                # Set proper ownership of backup file
+                subprocess.run(['sudo', 'chown', f"{os.getuid()}:{os.getgid()}", str(backup_path)], check=True)
+
+            finally:
+                # Cleanup
+                subprocess.run(['sudo', 'rm', '-rf', temp_dir], check=True)
 
             console.print(f"[green]✓ Backup created: {backup_path.name}[/green]")
             return True
@@ -253,57 +308,134 @@ class DockerManager:
                 # Check if container already exists
                 existing = run_docker_command(['ps', '-a', '--format', '{{.Names}}'])
                 if container_name in existing.splitlines():
-                    if not Confirm.ask(f"[yellow]Container {container_name} already exists. Remove it?[/yellow]"):
+                    console.print(f"\n[yellow]Container '{container_name}' already exists. You can:[/yellow]")
+                    console.print("1. Remove the existing container")
+                    console.print("2. Restore with a different name")
+                    console.print("3. Cancel restore")
+                    
+                    choice = console.input("\n[cyan]Choose an option (1-3):[/cyan] ")
+                    if choice == "1":
+                        run_docker_command(['rm', '-f', container_name])
+                    elif choice == "2":
+                        new_name = console.input("[cyan]Enter new container name:[/cyan] ")
+                        if not new_name:
+                            console.print("[red]Invalid name[/red]")
+                            return False
+                        container_name = new_name
+                    else:
                         return False
-                    run_docker_command(['rm', '-f', container_name])
 
                 # Restore volumes if they exist
                 volumes_dir = temp_path / "volumes"
                 if volumes_dir.exists():
                     for volume_dir in volumes_dir.iterdir():
                         if volume_dir.is_dir():
-                            volume_name = volume_dir.name
+                            original_volume_name = volume_dir.name
+                            # If restoring with a different name, use that name for the volume
+                            volume_name = container_name if container_name != container_info['Name'].lstrip('/') else original_volume_name
                             console.print(f"Restoring volume: {volume_name}")
                             
                             # Create volume if it doesn't exist
                             run_docker_command(['volume', 'create', volume_name])
                             
-                            # Copy data to volume
+                            # Copy data to volume using sudo for permissions
                             run_docker_command([
                                 'run', '--rm',
                                 '-v', f"{volume_name}:/target",
                                 '-v', f"{volume_dir}:/source",
                                 'alpine',
-                                'cp', '-a', '/source/.', '/target/'
+                                'sh', '-c', 'cp -a /source/. /target/ && chown -R root:root /target/'
                             ])
+
+                            # Update volume name in mounts for the container configuration
+                            for mount in container_info.get('Mounts', []):
+                                if mount.get('Type') == 'volume' and mount.get('Name') == original_volume_name:
+                                    mount['Name'] = volume_name
 
                 # Pull the image
                 console.print(f"Pulling image: {image}")
                 run_docker_command(['pull', image])
 
-                # Create container with original configuration
-                ports = []
-                if 'PortBindings' in container_info.get('HostConfig', {}):
-                    for container_port, host_bindings in container_info['HostConfig']['PortBindings'].items():
-                        for binding in host_bindings:
-                            ports.extend(['-p', f"{binding.get('HostPort', '')}:{container_port.split('/')[0]}"])
+                # Build run command with original configuration
+                run_cmd = ['run', '-d', '--name', container_name]
 
-                volumes = []
+                # Add restart policy if it exists
+                if 'RestartPolicy' in container_info.get('HostConfig', {}):
+                    policy = container_info['HostConfig']['RestartPolicy']
+                    if policy.get('Name'):
+                        run_cmd.extend(['--restart', policy['Name']])
+
+                # Handle port bindings and potential conflicts
+                if 'PortBindings' in container_info.get('HostConfig', {}):
+                    port_bindings = container_info['HostConfig']['PortBindings']
+                    if port_bindings:
+                        console.print("\n[yellow]Container port mappings:[/yellow]")
+                        for container_port, host_bindings in port_bindings.items():
+                            for binding in host_bindings:
+                                host_port = binding.get('HostPort', '')
+                                console.print(f"  {host_port}:{container_port}")
+                        
+                        console.print("\n[yellow]How would you like to handle port mappings?[/yellow]")
+                        console.print("1. Use original ports (might fail if ports are in use)")
+                        console.print("2. Map to different ports")
+                        console.print("3. Skip port mapping")
+                        
+                        port_choice = console.input("\n[cyan]Choose an option (1-3):[/cyan] ")
+                        
+                        if port_choice == "1":
+                            # Use original ports
+                            for container_port, host_bindings in port_bindings.items():
+                                for binding in host_bindings:
+                                    host_port = binding.get('HostPort', '')
+                                    run_cmd.extend(['-p', f"{host_port}:{container_port}"])
+                        elif port_choice == "2":
+                            # Map to different ports
+                            for container_port, host_bindings in port_bindings.items():
+                                for binding in host_bindings:
+                                    original_port = binding.get('HostPort', '')
+                                    while True:
+                                        new_port = console.input(f"[cyan]Enter new port for {container_port} (original: {original_port}):[/cyan] ")
+                                        if new_port.isdigit() and 1 <= int(new_port) <= 65535:
+                                            run_cmd.extend(['-p', f"{new_port}:{container_port}"])
+                                            break
+                                        console.print("[red]Invalid port number. Must be between 1 and 65535.[/red]")
+                        # Option 3: Skip port mapping (do nothing)
+
+                # Add volume mounts
                 if 'Mounts' in container_info:
                     for mount in container_info['Mounts']:
                         if mount['Type'] == 'volume':
-                            volumes.extend(['-v', f"{mount['Name']}:{mount['Destination']}"])
+                            run_cmd.extend(['-v', f"{mount['Name']}:{mount['Destination']}"])
+                        elif mount['Type'] == 'bind':
+                            run_cmd.extend(['-v', f"{mount['Source']}:{mount['Destination']}"])
 
-                # Create and start the container
-                run_cmd = ['run', '-d', '--name', container_name]
-                if ports:
-                    run_cmd.extend(ports)
-                if volumes:
-                    run_cmd.extend(volumes)
+                # Add environment variables
+                if 'Env' in container_info.get('Config', {}):
+                    for env in container_info['Config']['Env']:
+                        run_cmd.extend(['-e', env])
+
+                # Add network mode if specified
+                if 'NetworkMode' in container_info.get('HostConfig', {}):
+                    network_mode = container_info['HostConfig']['NetworkMode']
+                    if network_mode != 'default':
+                        run_cmd.extend(['--network', network_mode])
+
+                # Add labels
+                if 'Labels' in container_info.get('Config', {}):
+                    for label, value in container_info['Config']['Labels'].items():
+                        run_cmd.extend(['--label', f"{label}={value}"])
+
+                # Add the image
                 run_cmd.append(image)
 
-                console.print("Creating container...")
+                # Add command and args if specified
+                if 'Cmd' in container_info.get('Config', {}) and container_info['Config']['Cmd']:
+                    run_cmd.extend(container_info['Config']['Cmd'])
+
+                # Create and start the container
+                console.print("Creating container with original configuration...")
                 run_docker_command(run_cmd)
+
                 console.print(f"[green]✓ Container {container_name} restored successfully[/green]")
                 return True
 
