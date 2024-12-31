@@ -76,18 +76,23 @@ echo -e "${YELLOW}Installing/upgrading Python dependencies...${NC}"
 pip install --upgrade pip
 pip install -r requirements.txt
 
+# Install the package
+echo -e "${YELLOW}Installing docker-mgmt package...${NC}"
+pip install .
+
 # Make script executable if it isn't already
-if [ ! -x "docker_manager.py" ]; then
-    echo -e "${YELLOW}Making docker_manager.py executable...${NC}"
-    chmod +x docker_manager.py
+if [ ! -x "docker-mgmt" ]; then
+    echo -e "${YELLOW}Making docker-mgmt executable...${NC}"
+    chmod +x docker-mgmt
 else
-    echo -e "${GREEN}✓ docker_manager.py is already executable${NC}"
+    echo -e "${GREEN}✓ docker-mgmt is already executable${NC}"
 fi
 
 echo -e "\n${GREEN}Setup completed successfully!${NC}"
 echo -e "\n${YELLOW}To start using the tool:${NC}"
 echo -e "1. Activate the virtual environment: ${GREEN}source venv/bin/activate${NC}"
-echo -e "2. Run the tool: ${GREEN}./docker_manager.py --interactive${NC}"
+echo -e "2. Run the tool: ${GREEN}./docker-mgmt --interactive${NC}"
+echo -e "   or: ${GREEN}python -m docker_mgmt --interactive${NC}"
 
 # Check if we're in a virtual environment
 if [ -z "$VIRTUAL_ENV" ]; then
