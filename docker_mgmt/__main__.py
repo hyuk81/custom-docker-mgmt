@@ -8,6 +8,7 @@ from .ui.menu_handlers import (
     container_operations_menu,
     system_tools_menu,
     backup_menu,
+    installation_menu,
 )
 
 app = typer.Typer()
@@ -49,8 +50,7 @@ def main(interactive: bool = typer.Option(False, "--interactive", "-i", help="St
                     continue
                 backup_menu(manager)
             elif choice == 2:
-                # TODO: Implement installation_menu
-                pass
+                installation_menu()
             elif choice == 3:
                 system_tools_menu()
 

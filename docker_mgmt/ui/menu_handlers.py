@@ -6,6 +6,7 @@ from .menu import Menu
 from ..operations.docker_manager import DockerManager
 from ..utils.docker_utils import run_docker_command
 import typer
+import subprocess
 
 console = Console()
 
@@ -288,6 +289,130 @@ def backup_menu(manager: DockerManager):
                         backup_path.unlink()
                         console.print(f"[green]✓ Backup {backup_path.name} deleted[/green]")
                     input("\nPress Enter to continue...")
+
+        except Exception as e:
+            console.print(f"[red]✗ Operation failed: {e}[/red]")
+            input("\nPress Enter to continue...") 
+
+def installation_menu():
+    """Handle installation and configuration menu."""
+    while True:
+        items = [
+            "Check Docker installation",
+            "Install Docker",
+            "Update Docker",
+            "Configure Docker daemon",
+            "Configure user permissions",
+            "Change Docker root directory",
+            "View Docker info"
+        ]
+        
+        menu = Menu("Installation & Configuration", items)
+        choice = menu.show()
+        
+        if choice is None:
+            break
+        
+        try:
+            if choice == 0:  # Check Docker installation
+                output = run_docker_command(['--version'])
+                if output:
+                    console.print(f"[green]✓ Docker is installed:[/green]\n{output}")
+                    output = run_docker_command(['info'])
+                    if output:
+                        console.print(f"\n[bold]Docker System Information:[/bold]\n{output}")
+                else:
+                    console.print("[yellow]Docker is not installed[/yellow]")
+                input("\nPress Enter to continue...")
+
+            elif choice == 1:  # Install Docker
+                if run_docker_command(['--version']):
+                    console.print("[yellow]Docker is already installed[/yellow]")
+                else:
+                    console.print("[yellow]Installing Docker...[/yellow]")
+                    try:
+                        # Add Docker's official GPG key
+                        subprocess.run(['sudo', 'apt-get', 'update'], check=True)
+                        subprocess.run(['sudo', 'apt-get', 'install', '-y', 'ca-certificates', 'curl', 'gnupg'], check=True)
+                        subprocess.run(['sudo', 'install', '-m', '0755', '-d', '/etc/apt/keyrings'], check=True)
+                        subprocess.run('curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg', shell=True, check=True)
+                        subprocess.run(['sudo', 'chmod', 'a+r', '/etc/apt/keyrings/docker.gpg'], check=True)
+
+                        # Add the repository to Apt sources
+                        subprocess.run('''echo "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null''', shell=True, check=True)
+                        
+                        # Install Docker packages
+                        subprocess.run(['sudo', 'apt-get', 'update'], check=True)
+                        subprocess.run(['sudo', 'apt-get', 'install', '-y', 'docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'], check=True)
+                        
+                        console.print("[green]✓ Docker installed successfully[/green]")
+                    except subprocess.CalledProcessError as e:
+                        console.print(f"[red]✗ Failed to install Docker: {e}[/red]")
+                input("\nPress Enter to continue...")
+
+            elif choice == 2:  # Update Docker
+                console.print("[yellow]Updating Docker...[/yellow]")
+                try:
+                    subprocess.run(['sudo', 'apt-get', 'update'], check=True)
+                    subprocess.run(['sudo', 'apt-get', 'upgrade', '-y', 'docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'], check=True)
+                    console.print("[green]✓ Docker updated successfully[/green]")
+                except subprocess.CalledProcessError as e:
+                    console.print(f"[red]✗ Failed to update Docker: {e}[/red]")
+                input("\nPress Enter to continue...")
+
+            elif choice == 3:  # Configure Docker daemon
+                config_items = [
+                    "Set log level",
+                    "Configure storage driver",
+                    "Configure registry mirrors",
+                    "Back"
+                ]
+                config_menu = Menu("Docker Daemon Configuration", config_items)
+                config_choice = config_menu.show()
+                
+                if config_choice == 0:  # Set log level
+                    levels = ["debug", "info", "warn", "error"]
+                    level_menu = Menu("Select Log Level", levels)
+                    level_choice = level_menu.show()
+                    if level_choice is not None:
+                        try:
+                            subprocess.run(['sudo', 'mkdir', '-p', '/etc/docker'], check=True)
+                            with open('/etc/docker/daemon.json', 'w') as f:
+                                f.write(f'{{"log-level": "{levels[level_choice]}"}}')
+                            subprocess.run(['sudo', 'systemctl', 'restart', 'docker'], check=True)
+                            console.print(f"[green]✓ Log level set to {levels[level_choice]}[/green]")
+                        except Exception as e:
+                            console.print(f"[red]✗ Failed to set log level: {e}[/red]")
+
+            elif choice == 4:  # Configure user permissions
+                try:
+                    subprocess.run(['sudo', 'groupadd', '-f', 'docker'], check=True)
+                    subprocess.run(['sudo', 'usermod', '-aG', 'docker', '$USER'], check=True)
+                    console.print("[green]✓ User added to docker group[/green]")
+                    console.print("[yellow]Please log out and back in for changes to take effect[/yellow]")
+                except subprocess.CalledProcessError as e:
+                    console.print(f"[red]✗ Failed to configure permissions: {e}[/red]")
+                input("\nPress Enter to continue...")
+
+            elif choice == 5:  # Change Docker root directory
+                new_path = typer.prompt("Enter new Docker root directory path")
+                try:
+                    subprocess.run(['sudo', 'systemctl', 'stop', 'docker'], check=True)
+                    subprocess.run(['sudo', 'mkdir', '-p', new_path], check=True)
+                    with open('/etc/docker/daemon.json', 'w') as f:
+                        f.write(f'{{"data-root": "{new_path}"}}')
+                    subprocess.run(['sudo', 'rsync', '-aP', '/var/lib/docker/', new_path], check=True)
+                    subprocess.run(['sudo', 'systemctl', 'start', 'docker'], check=True)
+                    console.print(f"[green]✓ Docker root directory changed to {new_path}[/green]")
+                except Exception as e:
+                    console.print(f"[red]✗ Failed to change Docker root directory: {e}[/red]")
+                input("\nPress Enter to continue...")
+
+            elif choice == 6:  # View Docker info
+                output = run_docker_command(['info'])
+                if output:
+                    console.print(f"\n[bold]Docker System Information:[/bold]\n{output}")
+                input("\nPress Enter to continue...")
 
         except Exception as e:
             console.print(f"[red]✗ Operation failed: {e}[/red]")
