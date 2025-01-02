@@ -2,9 +2,9 @@
 import typer
 from rich.console import Console
 from pathlib import Path
-from .operations.docker_manager import DockerManager
-from .ui.menu import Menu
-from .ui.menu_handlers import (
+from docker_mgmt.operations.docker_manager import DockerManager
+from docker_mgmt.ui.menu import Menu
+from docker_mgmt.ui.menu_handlers import (
     container_operations_menu,
     system_tools_menu,
     backup_menu,
